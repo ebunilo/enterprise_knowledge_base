@@ -169,7 +169,12 @@ CREATE INDEX idx_users_active ON users(tenant_id, is_active) WHERE is_active = t
 ALTER TABLE users ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY users_tenant_isolation ON users
-    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+    USING (
+        tenant_id = COALESCE(
+            NULLIF(current_setting('app.current_tenant_id', true), '')::UUID,
+            tenant_id
+        )
+    );
 
 -- ============================================================================
 -- DOCUMENT SOURCES TABLE
@@ -217,7 +222,12 @@ CREATE INDEX idx_sources_sync ON document_sources(next_sync_at) WHERE sync_enabl
 ALTER TABLE document_sources ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY sources_tenant_isolation ON document_sources
-    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+    USING (
+        tenant_id = COALESCE(
+            NULLIF(current_setting('app.current_tenant_id', true), '')::UUID,
+            tenant_id
+        )
+    );
 
 -- ============================================================================
 -- DOCUMENTS TABLE
@@ -297,7 +307,12 @@ CREATE INDEX idx_documents_created_at ON documents(tenant_id, created_at DESC);
 ALTER TABLE documents ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY documents_tenant_isolation ON documents
-    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+    USING (
+        tenant_id = COALESCE(
+            NULLIF(current_setting('app.current_tenant_id', true), '')::UUID,
+            tenant_id
+        )
+    );
 
 -- ============================================================================
 -- DOCUMENT CHUNKS TABLE
@@ -355,7 +370,12 @@ CREATE INDEX idx_chunks_metadata ON document_chunks USING GIN(metadata);
 ALTER TABLE document_chunks ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY chunks_tenant_isolation ON document_chunks
-    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+    USING (
+        tenant_id = COALESCE(
+            NULLIF(current_setting('app.current_tenant_id', true), '')::UUID,
+            tenant_id
+        )
+    );
 
 -- ============================================================================
 -- ACCESS POLICIES TABLE
@@ -423,7 +443,12 @@ CREATE INDEX idx_policies_effective ON access_policies(effective_from, effective
 ALTER TABLE access_policies ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY policies_tenant_isolation ON access_policies
-    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+    USING (
+        tenant_id = COALESCE(
+            NULLIF(current_setting('app.current_tenant_id', true), '')::UUID,
+            tenant_id
+        )
+    );
 
 -- ============================================================================
 -- INGESTION JOBS TABLE
@@ -468,7 +493,12 @@ CREATE INDEX idx_jobs_created_at ON ingestion_jobs(tenant_id, created_at DESC);
 ALTER TABLE ingestion_jobs ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY jobs_tenant_isolation ON ingestion_jobs
-    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+    USING (
+        tenant_id = COALESCE(
+            NULLIF(current_setting('app.current_tenant_id', true), '')::UUID,
+            tenant_id
+        )
+    );
 
 -- ============================================================================
 -- AUDIT LOGS TABLE (Partitioned by month)
@@ -531,7 +561,12 @@ CREATE INDEX idx_audit_logs_resource ON audit_logs(tenant_id, resource_type, res
 ALTER TABLE audit_logs ENABLE ROW LEVEL SECURITY;
 
 CREATE POLICY audit_logs_tenant_isolation ON audit_logs
-    USING (tenant_id = current_setting('app.current_tenant_id')::UUID);
+    USING (
+        tenant_id = COALESCE(
+            NULLIF(current_setting('app.current_tenant_id', true), '')::UUID,
+            tenant_id
+        )
+    );
 
 -- ============================================================================
 -- FUNCTIONS
