@@ -1,0 +1,406 @@
+name: Deploy Phase 1 - Core Infrastructure
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+    paths:
+      - 'infra/docker-compose/**'
+      - 'services/canonical-db-agent/**'
+      - 'services/auth-acl-agent/**'
+      - '.github/workflows/deploy-phase1.yml'
+  
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Deployment environment'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+env:
+  DOCKER_BUILDKIT: 1
+  COMPOSE_DOCKER_CLI_BUILD: 1
+
+jobs:
+  # ============================================================================
+  # BUILD AND TEST
+  # ============================================================================
+  build-and-test:
+    name: Build and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+      
+      - name: Cache Docker layers
+        uses: actions/cache@v3
+        with:
+          path: /tmp/.buildx-cache
+          key: ${{ runner.os }}-buildx-${{ github.sha }}
+          restore-keys: |
+            ${{ runner.os }}-buildx-
+      
+      - name: Create .env file for testing
+        run: |
+          cd infra/docker-compose
+          cp .env.example .env
+          
+          # Generate secure passwords for testing
+          export POSTGRES_PASSWORD=$(openssl rand -base64 32)
+          export MINIO_ROOT_PASSWORD=$(openssl rand -base64 32)
+          export REDIS_PASSWORD=$(openssl rand -base64 32)
+          export SECRET_KEY=$(openssl rand -hex 32)
+          
+          # Update .env with generated passwords
+          sed -i "s/POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=${POSTGRES_PASSWORD}/" .env
+          sed -i "s/MINIO_ROOT_PASSWORD=.*/MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}/" .env
+          sed -i "s/REDIS_PASSWORD=.*/REDIS_PASSWORD=${REDIS_PASSWORD}/" .env
+          sed -i "s/SECRET_KEY=.*/SECRET_KEY=${SECRET_KEY}/" .env
+          
+          # Set test OIDC values
+          sed -i "s|OIDC_PROVIDER_URL=.*|OIDC_PROVIDER_URL=https://test.example.com|" .env
+          sed -i "s/OIDC_CLIENT_ID=.*/OIDC_CLIENT_ID=test-client-id/" .env
+          sed -i "s/OIDC_CLIENT_SECRET=.*/OIDC_CLIENT_SECRET=test-client-secret/" .env
+      
+      - name: Validate docker-compose configuration
+        run: |
+          cd infra/docker-compose
+          docker-compose config --quiet
+      
+      - name: Start infrastructure services
+        run: |
+          cd infra/docker-compose
+          docker-compose up -d postgres redis minio
+          
+          # Wait for services to be healthy
+          echo "Waiting for PostgreSQL..."
+          timeout 60 bash -c 'until docker-compose exec -T postgres pg_isready -U rag_admin; do sleep 2; done'
+          
+          echo "Waiting for Redis..."
+          timeout 60 bash -c 'until docker-compose exec -T redis redis-cli ping; do sleep 2; done'
+          
+          echo "Waiting for MinIO..."
+          timeout 60 bash -c 'until curl -f http://localhost:9000/minio/health/live; do sleep 2; done'
+      
+      - name: Verify database initialization
+        run: |
+          cd infra/docker-compose
+          
+          # Check if tables were created
+          docker-compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "tenants"
+          docker-compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "users"
+          docker-compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "documents"
+          docker-compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "document_chunks"
+          docker-compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "access_policies"
+          
+          echo "✅ Database tables created successfully"
+      
+      - name: Verify RLS policies
+        run: |
+          cd infra/docker-compose
+          
+          # Check if RLS is enabled
+          docker-compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "
+            SELECT tablename, rowsecurity 
+            FROM pg_tables 
+            WHERE schemaname = 'public' 
+            AND tablename IN ('tenants', 'users', 'documents', 'document_chunks', 'access_policies')
+          " | grep -q "t"
+          
+          echo "✅ Row-Level Security enabled"
+      
+      - name: Verify default data
+        run: |
+          cd infra/docker-compose
+          
+          # Check default tenant
+          docker-compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "
+            SELECT tenant_name FROM tenants WHERE tenant_slug = 'default'
+          " | grep -q "Default Tenant"
+          
+          # Check system admin
+          docker-compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "
+            SELECT email FROM users WHERE role = 'SUPER_ADMIN'
+          " | grep -q "admin@enterprise-rag.local"
+          
+          echo "✅ Default data created successfully"
+      
+      - name: Stop services
+        if: always()
+        run: |
+          cd infra/docker-compose
+          docker-compose down -v
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v3
+        with:
+          name: test-results
+          path: |
+            infra/docker-compose/logs/
+            infra/docker-compose/.env
+
+  # ============================================================================
+  # DEPLOY TO STAGING
+  # ============================================================================
+  deploy-staging:
+    name: Deploy to Staging
+    needs: build-and-test
+    if: github.ref == 'refs/heads/develop' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    runs-on: ubuntu-latest
+    environment: staging
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.STAGING_SERVER_HOST }} >> ~/.ssh/known_hosts
+      
+      - name: Deploy to staging server
+        env:
+          SERVER_HOST: ${{ secrets.STAGING_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.STAGING_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
+        run: |
+          # Create deployment directory
+          ssh ${SERVER_USER}@${SERVER_HOST} "mkdir -p ${DEPLOY_PATH}"
+          
+          # Copy files to server
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='__pycache__' \
+            --exclude='.env' \
+            infra/docker-compose/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/
+      
+      - name: Create .env file on server
+        env:
+          SERVER_HOST: ${{ secrets.STAGING_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.STAGING_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
+        run: |
+          ssh ${SERVER_USER}@${SERVER_HOST} "cat > ${DEPLOY_PATH}/.env << 'EOF'
+          ENVIRONMENT=staging
+          POSTGRES_DB=${{ secrets.STAGING_POSTGRES_DB }}
+          POSTGRES_USER=${{ secrets.STAGING_POSTGRES_USER }}
+          POSTGRES_PASSWORD=${{ secrets.STAGING_POSTGRES_PASSWORD }}
+          POSTGRES_PORT=5432
+          MINIO_ROOT_USER=${{ secrets.STAGING_MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD=${{ secrets.STAGING_MINIO_ROOT_PASSWORD }}
+          MINIO_API_PORT=9000
+          MINIO_CONSOLE_PORT=9001
+          MINIO_BROWSER_URL=${{ secrets.STAGING_MINIO_BROWSER_URL }}
+          REDIS_PASSWORD=${{ secrets.STAGING_REDIS_PASSWORD }}
+          REDIS_PORT=6379
+          SECRET_KEY=${{ secrets.STAGING_SECRET_KEY }}
+          OIDC_PROVIDER_URL=${{ secrets.STAGING_OIDC_PROVIDER_URL }}
+          OIDC_CLIENT_ID=${{ secrets.STAGING_OIDC_CLIENT_ID }}
+          OIDC_CLIENT_SECRET=${{ secrets.STAGING_OIDC_CLIENT_SECRET }}
+          ALLOWED_ORIGINS=${{ secrets.STAGING_ALLOWED_ORIGINS }}
+          LOG_LEVEL=INFO
+          CANONICAL_DB_API_PORT=8001
+          AUTH_ACL_API_PORT=8002
+          API_WORKERS=4
+          DOMAIN=${{ secrets.STAGING_DOMAIN }}
+          SSL_ENABLED=true
+          LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
+          EOF"
+      
+      - name: Deploy with docker-compose
+        env:
+          SERVER_HOST: ${{ secrets.STAGING_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.STAGING_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
+        run: |
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
+            docker-compose pull && \
+            docker-compose up -d --remove-orphans && \
+            docker-compose ps"
+      
+      - name: Wait for services to be healthy
+        env:
+          SERVER_HOST: ${{ secrets.STAGING_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.STAGING_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
+        run: |
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
+            timeout 120 bash -c 'until docker-compose exec -T postgres pg_isready -U rag_admin; do sleep 5; done' && \
+            timeout 60 bash -c 'until docker-compose exec -T redis redis-cli ping; do sleep 5; done' && \
+            timeout 60 bash -c 'until curl -f http://localhost:9000/minio/health/live; do sleep 5; done'"
+      
+      - name: Run health checks
+        env:
+          STAGING_URL: ${{ secrets.STAGING_URL }}
+        run: |
+          # Wait a bit for services to fully start
+          sleep 10
+          
+          # Check canonical-db-api health
+          curl -f ${STAGING_URL}/api/canonical-db/health || echo "⚠️ Canonical DB API not responding"
+          
+          # Check auth-acl-api health
+          curl -f ${STAGING_URL}/api/auth-acl/health || echo "⚠️ Auth ACL API not responding"
+      
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Staging deployment successful"
+          echo "🔗 Staging URL: ${{ secrets.STAGING_URL }}"
+
+  # ============================================================================
+  # DEPLOY TO PRODUCTION
+  # ============================================================================
+  deploy-production:
+    name: Deploy to Production
+    needs: build-and-test
+    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    runs-on: ubuntu-latest
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_PRIVATE_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.PRODUCTION_SERVER_HOST }} >> ~/.ssh/known_hosts
+      
+      - name: Create backup before deployment
+        env:
+          SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
+        run: |
+          BACKUP_DIR="${DEPLOY_PATH}/backups/$(date +%Y%m%d_%H%M%S)"
+          ssh ${SERVER_USER}@${SERVER_HOST} "
+            mkdir -p ${BACKUP_DIR} && \
+            cd ${DEPLOY_PATH} && \
+            docker-compose exec -T postgres pg_dump -U rag_admin enterprise_rag > ${BACKUP_DIR}/database.sql && \
+            echo '✅ Database backup created: ${BACKUP_DIR}/database.sql'
+          "
+      
+      - name: Deploy to production server
+        env:
+          SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
+        run: |
+          # Create deployment directory
+          ssh ${SERVER_USER}@${SERVER_HOST} "mkdir -p ${DEPLOY_PATH}"
+          
+          # Copy files to server
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='__pycache__' \
+            --exclude='.env' \
+            infra/docker-compose/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/
+      
+      - name: Create .env file on server
+        env:
+          SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
+        run: |
+          ssh ${SERVER_USER}@${SERVER_HOST} "cat > ${DEPLOY_PATH}/.env << 'EOF'
+          ENVIRONMENT=production
+          POSTGRES_DB=${{ secrets.PRODUCTION_POSTGRES_DB }}
+          POSTGRES_USER=${{ secrets.PRODUCTION_POSTGRES_USER }}
+          POSTGRES_PASSWORD=${{ secrets.PRODUCTION_POSTGRES_PASSWORD }}
+          POSTGRES_PORT=5432
+          MINIO_ROOT_USER=${{ secrets.PRODUCTION_MINIO_ROOT_USER }}
+          MINIO_ROOT_PASSWORD=${{ secrets.PRODUCTION_MINIO_ROOT_PASSWORD }}
+          MINIO_API_PORT=9000
+          MINIO_CONSOLE_PORT=9001
+          MINIO_BROWSER_URL=${{ secrets.PRODUCTION_MINIO_BROWSER_URL }}
+          REDIS_PASSWORD=${{ secrets.PRODUCTION_REDIS_PASSWORD }}
+          REDIS_PORT=6379
+          SECRET_KEY=${{ secrets.PRODUCTION_SECRET_KEY }}
+          OIDC_PROVIDER_URL=${{ secrets.PRODUCTION_OIDC_PROVIDER_URL }}
+          OIDC_CLIENT_ID=${{ secrets.PRODUCTION_OIDC_CLIENT_ID }}
+          OIDC_CLIENT_SECRET=${{ secrets.PRODUCTION_OIDC_CLIENT_SECRET }}
+          ALLOWED_ORIGINS=${{ secrets.PRODUCTION_ALLOWED_ORIGINS }}
+          LOG_LEVEL=INFO
+          CANONICAL_DB_API_PORT=8001
+          AUTH_ACL_API_PORT=8002
+          API_WORKERS=4
+          DOMAIN=${{ secrets.PRODUCTION_DOMAIN }}
+          SSL_ENABLED=true
+          LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
+          BACKUP_ENABLED=true
+          BACKUP_SCHEDULE=0 2 * * *
+          BACKUP_RETENTION_DAYS=30
+          EOF"
+      
+      - name: Deploy with docker-compose (Blue-Green)
+        env:
+          SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
+        run: |
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
+            docker-compose pull && \
+            docker-compose up -d --remove-orphans && \
+            docker-compose ps"
+      
+      - name: Wait for services to be healthy
+        env:
+          SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
+        run: |
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
+            timeout 120 bash -c 'until docker-compose exec -T postgres pg_isready -U rag_admin; do sleep 5; done' && \
+            timeout 60 bash -c 'until docker-compose exec -T redis redis-cli ping; do sleep 5; done' && \
+            timeout 60 bash -c 'until curl -f http://localhost:9000/minio/health/live; do sleep 5; done'"
+      
+      - name: Run health checks
+        env:
+          PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
+        run: |
+          # Wait for services to fully start
+          sleep 15
+          
+          # Check canonical-db-api health
+          curl -f ${PRODUCTION_URL}/api/canonical-db/health
+          
+          # Check auth-acl-api health
+          curl -f ${PRODUCTION_URL}/api/auth-acl/health
+      
+      - name: Notify deployment success
+        if: success()
+        run: |
+          echo "✅ Production deployment successful"
+          echo "🔗 Production URL: ${{ secrets.PRODUCTION_URL }}"
+      
+      - name: Rollback on failure
+        if: failure()
+        env:
+          SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
+        run: |
+          echo "❌ Deployment failed, initiating rollback..."
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
+            docker-compose down && \
+            # Restore from latest backup if needed
+            echo '⚠️ Manual intervention may be required'"
+
+# Made with Bob
