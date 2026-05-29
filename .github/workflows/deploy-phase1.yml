@@ -133,6 +133,17 @@ jobs:
           echo "✅ All services ready"
           docker compose ps
 
+      - name: Check init script execution
+        run: |
+          cd infra/docker-compose
+
+          echo "Manually running init script to capture errors..."
+          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -f /docker-entrypoint-initdb.d/01-init-database.sql 2>&1 || echo "Init script failed"
+
+          echo ""
+          echo "Checking what tables exist after manual run..."
+          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt"
+
       - name: Verify database initialization
         run: |
           cd infra/docker-compose
