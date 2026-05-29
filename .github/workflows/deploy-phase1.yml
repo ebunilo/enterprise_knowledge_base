@@ -372,13 +372,19 @@ jobs:
           SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
         run: |
-          BACKUP_DIR="${DEPLOY_PATH}/backups/$(date +%Y%m%d_%H%M%S)"
-          ssh ${SERVER_USER}@${SERVER_HOST} "
-            mkdir -p ${BACKUP_DIR} && \
-            cd ${DEPLOY_PATH} && \
-            docker compose exec -T postgres pg_dump -U rag_admin enterprise_rag > ${BACKUP_DIR}/database.sql && \
-            echo '✅ Database backup created: ${BACKUP_DIR}/database.sql'
-          "
+          # Check if deployment exists and services are running
+          if ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} 2>/dev/null && docker compose ps postgres 2>/dev/null | grep -q 'Up'"; then
+            echo "Existing deployment found, creating backup..."
+            BACKUP_DIR="${DEPLOY_PATH}/backups/$(date +%Y%m%d_%H%M%S)"
+            ssh ${SERVER_USER}@${SERVER_HOST} "
+              mkdir -p ${BACKUP_DIR} && \
+              cd ${DEPLOY_PATH} && \
+              docker compose exec -T postgres pg_dump -U rag_admin enterprise_rag > ${BACKUP_DIR}/database.sql && \
+              echo '✅ Database backup created: ${BACKUP_DIR}/database.sql'
+            "
+          else
+            echo "⚠️ No existing deployment found, skipping backup (this is a fresh deployment)"
+          fi
 
       - name: Deploy to production server
         env:
