@@ -285,11 +285,11 @@ CREATE TABLE documents (
     updated_by UUID REFERENCES users(user_id),
     
     -- Constraints
-    CONSTRAINT document_tenant_checksum_unique UNIQUE (tenant_id, checksum, is_current_version) WHERE is_current_version = true,
     CONSTRAINT file_size_positive CHECK (file_size_bytes >= 0)
 );
 
 -- Indexes
+CREATE UNIQUE INDEX idx_documents_tenant_checksum_unique ON documents(tenant_id, checksum, is_current_version) WHERE is_current_version = true;
 CREATE INDEX idx_documents_tenant ON documents(tenant_id);
 CREATE INDEX idx_documents_source ON documents(source_id);
 CREATE INDEX idx_documents_status ON documents(tenant_id, status);
