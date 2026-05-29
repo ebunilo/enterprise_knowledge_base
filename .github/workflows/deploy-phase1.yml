@@ -81,15 +81,27 @@ jobs:
           cd infra/docker-compose
           docker compose up -d postgres redis minio
 
-          # Wait for services to be healthy
-          echo "Waiting for PostgreSQL..."
+          # Wait for PostgreSQL to accept connections
+          echo "Waiting for PostgreSQL to accept connections..."
           timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U rag_admin; do sleep 2; done'
 
-          echo "Waiting for Redis..."
-          timeout 60 bash -c 'until docker compose exec -T redis redis-cli ping; do sleep 2; done'
+          # Wait for initialization scripts to complete (check if tables exist)
+          echo "Waiting for database initialization to complete..."
+          timeout 120 bash -c 'until docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" 2>/dev/null | grep -q "tenants"; do echo "Waiting for tables..."; sleep 5; done'
 
+          echo "✅ PostgreSQL initialized successfully"
+
+          # Wait for Redis
+          echo "Waiting for Redis..."
+          timeout 60 bash -c 'until docker compose exec -T redis redis-cli --no-auth-warning -a "${REDIS_PASSWORD}" ping 2>/dev/null | grep -q "PONG"; do sleep 2; done'
+
+          echo "✅ Redis ready"
+
+          # Wait for MinIO
           echo "Waiting for MinIO..."
-          timeout 60 bash -c 'until curl -f http://localhost:9000/minio/health/live; do sleep 2; done'
+          timeout 60 bash -c 'until curl -f http://localhost:9000/minio/health/live 2>/dev/null; do sleep 2; done'
+
+          echo "✅ MinIO ready"
 
       - name: Verify database initialization
         run: |
