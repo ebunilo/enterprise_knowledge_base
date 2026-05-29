@@ -102,7 +102,12 @@ jobs:
           # Check PostgreSQL logs for init script execution
           echo ""
           echo "Checking PostgreSQL logs for initialization..."
-          docker compose logs postgres | tail -50
+          docker compose logs postgres | tail -100
+
+          # Check for errors in logs
+          echo ""
+          echo "Checking for errors in PostgreSQL logs..."
+          docker compose logs postgres 2>&1 | grep -i "error" || echo "No errors found in logs"
 
           # Wait for initialization scripts to complete (check if tables exist)
           echo ""
