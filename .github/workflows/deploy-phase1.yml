@@ -79,19 +79,44 @@ jobs:
       - name: Start infrastructure services
         run: |
           cd infra/docker-compose
+
+          echo "Starting services..."
           docker compose up -d postgres redis minio
 
+          echo ""
+          echo "Checking if init script is mounted..."
+          docker compose exec -T postgres ls -la /docker-entrypoint-initdb.d/ || echo "Init directory not accessible yet"
+
           # Wait for PostgreSQL to accept connections
+          echo ""
           echo "Waiting for PostgreSQL to accept connections..."
           timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U rag_admin; do sleep 2; done'
 
+          echo "✅ PostgreSQL is accepting connections"
+
+          # Give init scripts time to run
+          echo ""
+          echo "Waiting for initialization scripts to execute..."
+          sleep 10
+
+          # Check PostgreSQL logs for init script execution
+          echo ""
+          echo "Checking PostgreSQL logs for initialization..."
+          docker compose logs postgres | tail -50
+
           # Wait for initialization scripts to complete (check if tables exist)
-          echo "Waiting for database initialization to complete..."
-          timeout 120 bash -c 'until docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" 2>/dev/null | grep -q "tenants"; do echo "Waiting for tables..."; sleep 5; done'
+          echo ""
+          echo "Waiting for database tables to be created..."
+          timeout 120 bash -c 'until docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" 2>/dev/null | grep -q "tenants"; do
+            echo "Waiting for tables... (checking every 5 seconds)";
+            docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" 2>/dev/null | head -10 || echo "Database not ready yet";
+            sleep 5;
+          done'
 
           echo "✅ PostgreSQL initialized successfully"
 
           # Wait for all services to be healthy using docker compose ps
+          echo ""
           echo "Waiting for all services to be healthy..."
           timeout 120 bash -c 'until docker compose ps | grep -E "(redis|minio)" | grep -v "Up" | wc -l | grep -q "^0$"; do
             echo "Waiting for services...";
@@ -99,6 +124,7 @@ jobs:
             sleep 5;
           done'
 
+          echo ""
           echo "✅ All services ready"
           docker compose ps
 
@@ -106,14 +132,45 @@ jobs:
         run: |
           cd infra/docker-compose
 
-          # Check if tables were created
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "tenants"
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "users"
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "documents"
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "document_chunks"
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "access_policies"
+          echo "Checking database tables..."
+          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt"
 
-          echo "✅ Database tables created successfully"
+          echo ""
+          echo "Verifying required tables exist..."
+
+          # Check if tables were created
+          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "tenants"; then
+            echo "❌ Table 'tenants' not found"
+            exit 1
+          fi
+          echo "✅ Table 'tenants' found"
+
+          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "users"; then
+            echo "❌ Table 'users' not found"
+            exit 1
+          fi
+          echo "✅ Table 'users' found"
+
+          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "documents"; then
+            echo "❌ Table 'documents' not found"
+            exit 1
+          fi
+          echo "✅ Table 'documents' found"
+
+          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "document_chunks"; then
+            echo "❌ Table 'document_chunks' not found"
+            exit 1
+          fi
+          echo "✅ Table 'document_chunks' found"
+
+          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "access_policies"; then
+            echo "❌ Table 'access_policies' not found"
+            exit 1
+          fi
+          echo "✅ Table 'access_policies' found"
+
+          echo ""
+          echo "✅ All required database tables created successfully"
 
       - name: Verify RLS policies
         run: |
