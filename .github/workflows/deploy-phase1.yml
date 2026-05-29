@@ -91,18 +91,16 @@ jobs:
 
           echo "✅ PostgreSQL initialized successfully"
 
-          # Wait for Redis (read password from .env file)
-          echo "Waiting for Redis..."
-          REDIS_PASS=$(grep REDIS_PASSWORD .env | cut -d '=' -f2)
-          timeout 60 bash -c "until docker compose exec -T redis redis-cli --no-auth-warning -a '$REDIS_PASS' ping 2>/dev/null | grep -q 'PONG'; do sleep 2; done"
+          # Wait for all services to be healthy using docker compose ps
+          echo "Waiting for all services to be healthy..."
+          timeout 120 bash -c 'until docker compose ps | grep -E "(redis|minio)" | grep -v "Up" | wc -l | grep -q "^0$"; do
+            echo "Waiting for services...";
+            docker compose ps | grep -E "(redis|minio)";
+            sleep 5;
+          done'
 
-          echo "✅ Redis ready"
-
-          # Wait for MinIO
-          echo "Waiting for MinIO..."
-          timeout 60 bash -c 'until curl -f http://localhost:9000/minio/health/live 2>/dev/null; do sleep 2; done'
-
-          echo "✅ MinIO ready"
+          echo "✅ All services ready"
+          docker compose ps
 
       - name: Verify database initialization
         run: |
