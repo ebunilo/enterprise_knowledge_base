@@ -105,7 +105,7 @@ services:
   # Canonical DB Agent API (Phase 1)
   canonical-db-api:
     build:
-      context: ../services/canonical-db-agent
+      context: ./services/canonical-db-agent
       dockerfile: Dockerfile
     container_name: enterprise-rag-canonical-db-api
     restart: unless-stopped
@@ -159,7 +159,7 @@ services:
   # Auth ACL Agent API (Phase 1)
   auth-acl-api:
     build:
-      context: ../services/auth-acl-agent
+      context: ./services/auth-acl-agent
       dockerfile: Dockerfile
     container_name: enterprise-rag-auth-acl-api
     restart: unless-stopped
