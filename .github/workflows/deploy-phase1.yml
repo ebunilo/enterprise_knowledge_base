@@ -260,16 +260,26 @@ jobs:
           SERVER_USER: ${{ secrets.STAGING_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
         run: |
-          # Create deployment directory
+          # Create deployment directory structure
           ssh ${SERVER_USER}@${SERVER_HOST} "mkdir -p ${DEPLOY_PATH}"
 
-          # Copy files to server
+          # Copy docker-compose files to server
           rsync -avz --delete \
             --exclude='.git' \
             --exclude='node_modules' \
             --exclude='__pycache__' \
             --exclude='.env' \
             infra/docker-compose/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/
+
+          # Copy services directory to server (required for Docker builds)
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.pytest_cache' \
+            --exclude='.venv' \
+            services/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/services/
 
       - name: Create .env file on server
         env:
@@ -392,16 +402,26 @@ jobs:
           SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
         run: |
-          # Create deployment directory
+          # Create deployment directory structure
           ssh ${SERVER_USER}@${SERVER_HOST} "mkdir -p ${DEPLOY_PATH}"
 
-          # Copy files to server
+          # Copy docker-compose files to server
           rsync -avz --delete \
             --exclude='.git' \
             --exclude='node_modules' \
             --exclude='__pycache__' \
             --exclude='.env' \
             infra/docker-compose/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/
+
+          # Copy services directory to server (required for Docker builds)
+          rsync -avz --delete \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='__pycache__' \
+            --exclude='*.pyc' \
+            --exclude='.pytest_cache' \
+            --exclude='.venv' \
+            services/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/services/
 
       - name: Create .env file on server
         env:
