@@ -167,9 +167,14 @@ services:
       # Database
       DATABASE_URL: postgresql://${POSTGRES_USER:-rag_admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-enterprise_rag}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
+      DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
+      DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
 
       # Redis
-      REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/1
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
+      REDIS_DB: 1
       CACHE_TTL: ${CACHE_TTL:-300}
 
       # API
