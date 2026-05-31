@@ -73,7 +73,7 @@ async def lifespan(app: FastAPI):
     logger.info(f"Version: 0.1.0")
     logger.info(f"Environment: {settings.environment}")
     logger.info(f"Database: {settings.database_url.split('@')[-1]}")  # Hide credentials
-    logger.info(f"Redis: {settings.redis_host}:{settings.redis_port}")
+    logger.info(f"Redis: {settings.redis_url}")
     logger.info(f"RLS Enabled: {settings.rls_enabled}")
     logger.info(f"CORS Origins: {settings.cors_origins}")
     logger.info("=" * 80)
