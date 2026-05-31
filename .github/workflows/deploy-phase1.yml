@@ -302,7 +302,7 @@ jobs:
           MINIO_CONSOLE_PORT=${{ secrets.STAGING_MINIO_CONSOLE_PORT || '9001' }}
           MINIO_BROWSER_URL=${{ secrets.STAGING_MINIO_BROWSER_URL }}
           REDIS_PASSWORD=${{ secrets.STAGING_REDIS_PASSWORD }}
-          REDIS_PORT=${{ secrets.STAGING_REDIS_PORT || '6379' }}
+          REDIS_PORT=${{ secrets.STAGING_REDIS_PORT || '6380' }}
           CACHE_TTL=300
           SECRET_KEY=${{ secrets.STAGING_SECRET_KEY }}
           JWT_ALGORITHM=RS256
@@ -465,7 +465,7 @@ jobs:
           MINIO_CONSOLE_PORT=${{ secrets.PRODUCTION_MINIO_CONSOLE_PORT || '9311' }}
           MINIO_BROWSER_URL=${{ secrets.PRODUCTION_MINIO_BROWSER_URL || 'https://storage.igwilo.com' }}
           REDIS_PASSWORD=${{ secrets.PRODUCTION_REDIS_PASSWORD }}
-          REDIS_PORT=${{ secrets.PRODUCTION_REDIS_PORT || '6379' }}
+          REDIS_PORT=${{ secrets.PRODUCTION_REDIS_PORT || '6380' }}
           CACHE_TTL=300
           SECRET_KEY=${{ secrets.PRODUCTION_SECRET_KEY }}
           JWT_ALGORITHM=RS256
