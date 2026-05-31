@@ -14,7 +14,8 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-from prometheus_client import Counter, Histogram
+# Prometheus disabled for Phase 1 MVP
+# from prometheus_client import Counter, Histogram
 
 from app.config import settings
 from app.database import check_database_connection, check_redis_connection
@@ -37,32 +38,22 @@ else:
 logger = logging.getLogger(__name__)
 
 # ============================================================================
-# Prometheus Metrics
+# Prometheus Metrics (Disabled for Phase 1 MVP)
 # ============================================================================
+# Metrics will be enabled in later phases when observability is implemented
+# For now, we use None to disable metric collection
 
-http_requests_total = Counter(
-    'http_requests_total',
-    'Total HTTP requests',
-    ['method', 'endpoint', 'status']
-)
+http_requests_total = None
+http_request_duration_seconds = None
+http_request_size_bytes = None
 
-http_request_duration_seconds = Histogram(
-    'http_request_duration_seconds',
-    'HTTP request duration in seconds',
-    ['method', 'endpoint']
-)
-
-http_request_size_bytes = Histogram(
-    'http_request_size_bytes',
-    'HTTP request size in bytes',
-    ['method', 'endpoint']
-)
-
-http_response_size_bytes = Histogram(
-    'http_response_size_bytes',
-    'HTTP response size in bytes',
-    ['method', 'endpoint']
-)
+http_response_size_bytes = None
+# Disabled for Phase 1 MVP - will be enabled in observability phase
+# http_response_size_bytes = Histogram(
+#     'http_response_size_bytes',
+#     'HTTP response size in bytes',
+#     ['method', 'endpoint']
+# )
 
 
 # ============================================================================
@@ -171,30 +162,32 @@ async def add_process_time_header(request: Request, call_next):
     # Get response size
     response_size = int(response.headers.get("content-length", 0))
     
-    # Record metrics
-    endpoint = request.url.path
-    method = request.method
-    status_code = response.status_code
-    
-    http_requests_total.labels(
-        method=method,
-        endpoint=endpoint,
-        status=status_code
-    ).inc()
-    
-    http_request_duration_seconds.labels(
-        method=method,
-        endpoint=endpoint
-    ).observe(process_time)
-    
-    if request_size > 0:
-        http_request_size_bytes.labels(
+    # Record metrics (disabled for Phase 1 MVP)
+    # Metrics will be enabled in later phases
+    if http_requests_total is not None:
+        endpoint = request.url.path
+        method = request.method
+        status_code = response.status_code
+        
+        http_requests_total.labels(
+            method=method,
+            endpoint=endpoint,
+            status=status_code
+        ).inc()
+        
+        http_request_duration_seconds.labels(
             method=method,
             endpoint=endpoint
-        ).observe(request_size)
-    
-    if response_size > 0:
-        http_response_size_bytes.labels(
+        ).observe(process_time)
+        
+        if request_size > 0:
+            http_request_size_bytes.labels(
+                method=method,
+                endpoint=endpoint
+            ).observe(request_size)
+        
+        if response_size > 0 and http_response_size_bytes is not None:
+            http_response_size_bytes.labels(
             method=method,
             endpoint=endpoint
         ).observe(response_size)
