@@ -15,7 +15,7 @@ services:
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
       - ./postgres/conf/postgresql.conf:/etc/postgresql/postgresql.conf:ro
     ports:
-      - "${POSTGRES_PORT:-5432}:5432"
+      - "${POSTGRES_PORT:-5433}:5432"
     command: postgres -c config_file=/etc/postgresql/postgresql.conf
     healthcheck:
       test:
