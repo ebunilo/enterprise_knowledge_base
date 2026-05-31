@@ -21,10 +21,19 @@ from app.database import check_database_connection, check_redis_connection
 from app.routers import chunks, documents, health
 
 # Configure logging
-logging.basicConfig(
-    level=settings.log_level,
-    format=settings.log_format
-)
+if settings.log_format.lower() == "json":
+    # For JSON logging, use a standard format and let structured logging handle it
+    # In production, you'd use python-json-logger or similar
+    logging.basicConfig(
+        level=settings.log_level,
+        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+    )
+else:
+    # Use the provided format string
+    logging.basicConfig(
+        level=settings.log_level,
+        format=settings.log_format
+    )
 logger = logging.getLogger(__name__)
 
 # ============================================================================
