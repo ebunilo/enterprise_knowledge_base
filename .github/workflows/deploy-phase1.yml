@@ -524,6 +524,7 @@ jobs:
         run: |
           ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
             docker compose pull && \
+            docker compose build --no-cache canonical-db-api auth-acl-api && \
             docker compose up -d --remove-orphans && \
             echo '=== Container Status ===' && \
             docker compose ps"
