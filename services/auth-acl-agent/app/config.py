@@ -83,10 +83,7 @@ class Settings(BaseSettings):
 # Global settings instance
 settings = Settings()
 
-# Configure logging
-logging.basicConfig(
-    level=getattr(logging, settings.log_level),
-    format=settings.log_format
-)
+# Note: Logging is configured in main.py to properly handle "json" vs "text" format
+# Do not configure logging here to avoid conflicts
 
 # Made with Bob
