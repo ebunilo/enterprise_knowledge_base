@@ -525,7 +525,34 @@ jobs:
           ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
             docker compose pull && \
             docker compose up -d --remove-orphans && \
+            echo '=== Container Status ===' && \
             docker compose ps"
+
+      - name: Check container logs on failure
+        if: failure()
+        env:
+          SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
+          SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
+          DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
+        run: |
+          echo "=== Canonical DB API Logs ==="
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose logs --tail=100 canonical-db-api" || true
+
+          echo ""
+          echo "=== Auth ACL API Logs ==="
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose logs --tail=100 auth-acl-api" || true
+
+          echo ""
+          echo "=== PostgreSQL Logs ==="
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose logs --tail=50 postgres" || true
+
+          echo ""
+          echo "=== Redis Logs ==="
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose logs --tail=50 redis" || true
+
+          echo ""
+          echo "=== Container Status ==="
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose ps -a" || true
 
       - name: Wait for services to be healthy
         env:
