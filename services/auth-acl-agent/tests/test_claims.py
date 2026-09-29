@@ -24,6 +24,23 @@ def test_keycloak_documented_claims():
     assert claims["is_employee"] is True
 
 
+def test_enterprise_rag_realm_token_shape():
+    # Access token as issued by infra/keycloak/setup_realm.py via enterprise-rag-web
+    token = {
+        "sub": "0f6c", "azp": "enterprise-rag-web", "aud": ["enterprise-rag-api", "account"],
+        "typ": "Bearer", "tenant_id": "global-company", "groups": ["/finance", "/internal-users"],
+        "department": "Finance", "role": "finance_manager", "region": "emea", "country": "Germany",
+        "clearance": "confidential", "is_employee": True,
+        "realm_access": {"roles": ["default-roles-enterprise-rag", "offline_access", "uma_authorization"]},
+    }
+    claims = normalize_claims(token, "enterprise-rag-api", EXTERNAL)
+    assert claims["tenant_ref"] == "global-company"
+    assert claims["groups"] == ["finance", "internal-users"]
+    assert claims["roles"] == ["finance_manager"]
+    assert claims["clearance"] == "CONFIDENTIAL"
+    assert claims["is_employee"] is True
+
+
 def test_realm_and_client_roles_merged_without_keycloak_defaults():
     token = {
         "sub": "u", "role": "Finance_Manager",

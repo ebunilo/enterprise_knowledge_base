@@ -65,6 +65,14 @@ async def test_audience_mapper_token_accepted():
     assert await oidc.validate_token(make_token(aud=[CLIENT, "account"], azp="other")) is not None
 
 
+async def test_web_client_token_with_api_audience_accepted(monkeypatch):
+    # Realm setup: enterprise-rag-web adds enterprise-rag-api to `aud`; the backend validates as the API client.
+    monkeypatch.setattr(oidc.settings, "oidc_client_id", "enterprise-rag-api")
+    token = make_token(azp="enterprise-rag-web", aud=["enterprise-rag-api", "account"])
+    assert await oidc.validate_token(token) is not None
+    assert await oidc.validate_token(make_token(azp="enterprise-rag-web", aud="account")) is None
+
+
 async def test_foreign_client_token_rejected():
     assert await oidc.validate_token(make_token(azp="some-other-app", aud="account")) is None
 
