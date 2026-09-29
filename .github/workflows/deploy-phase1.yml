@@ -234,6 +234,7 @@ jobs:
           DB_POOL_SIZE=20
           DB_MAX_OVERFLOW=10
           DB_POOL_TIMEOUT=30
+          MINIO_IMAGE=${{ secrets.STAGING_MINIO_IMAGE || 'minio/minio:latest' }}
           MINIO_ROOT_USER=${{ secrets.STAGING_MINIO_ROOT_USER || 'minioadmin' }}
           MINIO_ROOT_PASSWORD=${{ secrets.STAGING_MINIO_ROOT_PASSWORD }}
           MINIO_API_PORT=${{ secrets.STAGING_MINIO_API_PORT || '9000' }}
@@ -351,6 +352,7 @@ jobs:
           DB_POOL_SIZE=20
           DB_MAX_OVERFLOW=10
           DB_POOL_TIMEOUT=30
+          MINIO_IMAGE=${{ secrets.PRODUCTION_MINIO_IMAGE || 'minio/minio:latest' }}
           MINIO_ROOT_USER=${{ secrets.PRODUCTION_MINIO_ROOT_USER || 'minioadmin' }}
           MINIO_ROOT_PASSWORD=${{ secrets.PRODUCTION_MINIO_ROOT_PASSWORD }}
           MINIO_API_PORT=${{ secrets.PRODUCTION_MINIO_API_PORT || '9310' }}
@@ -379,7 +381,7 @@ jobs:
           DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
         run: |
           ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
-            docker compose pull postgres redis minio && \
+            docker compose pull postgres redis && \
             docker compose up -d postgres redis minio && \
             timeout 120 bash -c 'until docker compose exec -T postgres pg_isready -U rag_admin; do sleep 3; done' && \
             docker compose exec -T postgres bash /migrations/migrate.sh && \

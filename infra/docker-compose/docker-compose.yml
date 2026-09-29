@@ -48,8 +48,14 @@ services:
     logging: *default-logging
 
   # MinIO - S3-Compatible Object Storage
+  # minio/minio was removed from Docker Hub. Default to Chainguard's maintained
+  # build; existing servers keep their locally cached image by setting
+  # MINIO_IMAGE=minio/minio:latest (pull_policy: missing never re-pulls it).
   minio:
-    image: minio/minio:latest
+    image: ${MINIO_IMAGE:-cgr.dev/chainguard/minio:latest}
+    pull_policy: missing
+    # Upstream MinIO ran as root; keeps existing root-owned volumes writable.
+    user: "0:0"
     container_name: enterprise-rag-minio
     restart: unless-stopped
     environment:
@@ -62,12 +68,8 @@ services:
       - "${BIND_ADDRESS:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000"
       - "${BIND_ADDRESS:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
     command: server /data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "mc", "ready", "local"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+    # No healthcheck: minimal images ship neither curl nor mc, and no service
+    # depends on MinIO yet.
     networks:
       - rag_network
     logging: *default-logging
