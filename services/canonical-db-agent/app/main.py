@@ -1,299 +1,117 @@
 """
 Canonical DB Agent - FastAPI Application
 
-Main application module for the Canonical DB Agent API.
-Provides document and chunk metadata management for the Enterprise RAG System.
+PostgreSQL is the source of truth for documents, chunks, versions and audit
+references (AGENTS.md 5.1). Qdrant, BM25 and the knowledge graph resolve back
+to these records by stable IDs.
 """
 
 import logging
 import time
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, Request, status
+from fastapi import Depends, FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-# Prometheus disabled for Phase 1 MVP
-# from prometheus_client import Counter, Histogram
 
+from app import __version__
 from app.config import settings
-from app.database import check_database_connection, check_redis_connection
-from app.routers import chunks, documents, health
+from app.database import check_database_connection, check_redis_connection, ensure_audit_partitions
+from app.dependencies import verify_api_key
+from app.routers import chunks, documents, feedback, health
 
-# Configure logging
-if settings.log_format.lower() == "json":
-    # For JSON logging, use a standard format and let structured logging handle it
-    # In production, you'd use python-json-logger or similar
-    logging.basicConfig(
-        level=settings.log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-else:
-    # Use the provided format string
-    logging.basicConfig(
-        level=settings.log_level,
-        format=settings.log_format
-    )
+logging.basicConfig(
+    level=settings.log_level.upper(),
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Prometheus Metrics (Disabled for Phase 1 MVP)
-# ============================================================================
-# Metrics will be enabled in later phases when observability is implemented
-# For now, we use None to disable metric collection
-
-http_requests_total = None
-http_request_duration_seconds = None
-http_request_size_bytes = None
-
-http_response_size_bytes = None
-# Disabled for Phase 1 MVP - will be enabled in observability phase
-# http_response_size_bytes = Histogram(
-#     'http_response_size_bytes',
-#     'HTTP response size in bytes',
-#     ['method', 'endpoint']
-# )
-
-
-# ============================================================================
-# Lifespan Events
-# ============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application lifespan manager.
-    
-    Handles startup and shutdown events.
-    """
-    # Startup
-    logger.info("=" * 80)
-    logger.info("Starting Canonical DB Agent API")
-    logger.info(f"Version: 0.1.0")
-    logger.info(f"Environment: {settings.environment}")
-    logger.info(f"Database: {settings.database_url.split('@')[-1]}")  # Hide credentials
-    logger.info(f"Redis: {settings.redis_url}")
-    logger.info(f"RLS Enabled: {settings.rls_enabled}")
-    logger.info(f"CORS Origins: {settings.cors_origins}")
-    logger.info("=" * 80)
-    
-    # Check database connection
+    logger.info("Starting Canonical DB Agent API %s (%s)", __version__, settings.environment)
+    logger.info("Database: %s", settings.database_url.split("@")[-1])  # host/db only, no credentials
+
     if check_database_connection():
-        logger.info("✓ Database connection successful")
+        logger.info("Database connection successful")
+        ensure_audit_partitions()
     else:
-        logger.error("✗ Database connection failed")
-    
-    # Check Redis connection
-    if check_redis_connection():
-        logger.info("✓ Redis connection successful")
-    else:
-        logger.warning("✗ Redis connection failed (non-critical)")
-    
-    logger.info("Canonical DB Agent API started successfully")
-    
+        logger.error("Database connection failed")
+
+    if not check_redis_connection():
+        logger.warning("Redis connection failed (non-critical)")
+
     yield
-    
-    # Shutdown
     logger.info("Shutting down Canonical DB Agent API")
-    logger.info("Cleanup complete")
 
-
-# ============================================================================
-# FastAPI Application
-# ============================================================================
 
 app = FastAPI(
     title="Canonical DB Agent API",
     description=(
-        "Document and chunk metadata management for Enterprise RAG System. "
-        "Provides CRUD operations for documents, chunks, and versions with "
-        "multi-tenant support and Row-Level Security."
+        "Canonical store for documents, chunks, versions, retrieval audit "
+        "records and feedback. Multi-tenant with PostgreSQL Row-Level Security."
     ),
-    version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-    lifespan=lifespan
+    version=__version__,
+    lifespan=lifespan,
 )
 
-
-# ============================================================================
-# Middleware
-# ============================================================================
-
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Total-Count", "X-Request-ID"]
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-API-Key", "X-Tenant-ID", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
 )
-
-# GZip Compression
-app.add_middleware(
-    GZipMiddleware,
-    minimum_size=1000
-)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
-# Request timing and metrics middleware
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
-    """
-    Add request processing time header and collect metrics.
-    """
-    start_time = time.time()
-    
-    # Get request size
-    request_size = int(request.headers.get("content-length", 0))
-    
-    # Process request
+    start_time = time.perf_counter()
     response = await call_next(request)
-    
-    # Calculate duration
-    process_time = time.time() - start_time
-    
-    # Add headers
-    response.headers["X-Process-Time"] = str(process_time)
-    
-    # Get response size
-    response_size = int(response.headers.get("content-length", 0))
-    
-    # Record metrics (disabled for Phase 1 MVP)
-    # Metrics will be enabled in later phases
-    if http_requests_total is not None:
-        endpoint = request.url.path
-        method = request.method
-        status_code = response.status_code
-        
-        http_requests_total.labels(
-            method=method,
-            endpoint=endpoint,
-            status=status_code
-        ).inc()
-        
-        http_request_duration_seconds.labels(
-            method=method,
-            endpoint=endpoint
-        ).observe(process_time)
-        
-        if request_size > 0:
-            http_request_size_bytes.labels(
-                method=method,
-                endpoint=endpoint
-            ).observe(request_size)
-        
-        if response_size > 0 and http_response_size_bytes is not None:
-            http_response_size_bytes.labels(
-            method=method,
-            endpoint=endpoint
-        ).observe(response_size)
-    
+    response.headers["X-Process-Time"] = f"{time.perf_counter() - start_time:.4f}"
     return response
 
 
-# ============================================================================
-# Exception Handlers
-# ============================================================================
-
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """
-    Handle request validation errors.
-    """
-    logger.warning(f"Validation error: {exc.errors()}")
-    
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "error": "Validation Error",
             "detail": "Request validation failed",
-            "errors": exc.errors()
-        }
+            "errors": jsonable_encoder(exc.errors()),
+        },
     )
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """
-    Handle unexpected exceptions.
-    """
-    logger.error(f"Unexpected error: {exc}", exc_info=True)
-    
+    logger.error("Unexpected error on %s %s: %s", request.method, request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "error": "Internal Server Error",
-            "detail": "An unexpected error occurred"
-        }
+        content={"error": "Internal Server Error", "detail": "An unexpected error occurred"},
     )
 
 
-# ============================================================================
-# Routers
-# ============================================================================
+app.include_router(health.router, tags=["Health"])
 
-# Health check router (no prefix)
-app.include_router(
-    health.router,
-    tags=["Health"]
-)
-
-# API v1 routers
-app.include_router(
-    documents.router,
-    prefix="/api/v1",
-    tags=["Documents"]
-)
-
-app.include_router(
-    chunks.router,
-    prefix="/api/v1",
-    tags=["Chunks"]
-)
+_secured = [Depends(verify_api_key)]
+app.include_router(documents.router, prefix="/api/v1", dependencies=_secured)
+app.include_router(chunks.router, prefix="/api/v1", dependencies=_secured)
+app.include_router(feedback.router, prefix="/api/v1", dependencies=_secured)
 
 
-# ============================================================================
-# Root Endpoint
-# ============================================================================
-
-@app.get(
-    "/",
-    summary="Root endpoint",
-    description="Get API information",
-    tags=["Root"]
-)
+@app.get("/", tags=["Root"])
 async def root():
-    """
-    Root endpoint - returns API information.
-    """
     return {
         "service": "canonical-db-agent",
-        "version": "0.1.0",
-        "description": "Document and chunk metadata management for Enterprise RAG System",
+        "version": __version__,
         "status": "running",
         "docs": "/docs",
         "health": "/health",
-        "metrics": "/metrics"
     }
-
-
-# ============================================================================
-# Application Entry Point
-# ============================================================================
-
-if __name__ == "__main__":
-    import uvicorn
-    
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level=settings.log_level.lower()
-    )
-
-# Made with Bob

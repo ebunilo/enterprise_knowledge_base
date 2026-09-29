@@ -1,623 +1,420 @@
 """
-CRUD operations for database entities.
+CRUD operations for canonical records.
 
-This module provides all database CRUD operations with tenant isolation,
-error handling, and transaction management.
+Every function takes an explicit tenant_id and filters on it. RLS enforces the
+same boundary in the database, but only when the service connects as the
+non-superuser application role; the explicit filters keep isolation intact
+either way (defence in depth, AGENTS.md section 1.5).
+
+Versioning model: each document version is its own `documents` row. The
+logical document is (tenant_id, source_uri). Exactly one version is current.
+A new version is created non-current and only replaces the current one when
+activated, so retrieval never has a gap or sees two versions at once.
 """
 
 import hashlib
 import logging
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 from uuid import UUID
 
-from sqlalchemy import and_, func, or_
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from sqlalchemy import and_, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.models import (
     Document,
     DocumentChunk,
-    DocumentVersion,
+    DocumentStatus,
+    RetrievalAuditLog,
     Tenant,
+    UserFeedback,
 )
-from app.schemas import (
-    ChunkCreate,
-    DocumentCreate,
-    DocumentUpdate,
-)
+from app.schemas import ChunkCreate, DocumentCreate, DocumentUpdate, FeedbackCreate, RetrievalAuditCreate
 
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# Custom Exceptions
-# ============================================================================
-
 class DatabaseError(Exception):
     """Base exception for database errors."""
-    pass
 
 
 class NotFoundError(DatabaseError):
-    """Exception raised when entity is not found."""
-    pass
+    """Entity not found (or not visible to this tenant)."""
 
 
 class DuplicateError(DatabaseError):
-    """Exception raised when duplicate entity is created."""
-    pass
+    """Entity already exists."""
 
 
-class TenantMismatchError(DatabaseError):
-    """Exception raised when tenant context doesn't match."""
-    pass
+class ConflictError(DatabaseError):
+    """Operation not valid for the entity's current state."""
+
+
+def sha256_hex(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
 
 # ============================================================================
-# Tenant Operations
+# Tenants
 # ============================================================================
 
-def get_tenant(db: Session, tenant_id: str) -> Optional[Tenant]:
-    """Get tenant by ID."""
+def resolve_tenant(db: Session, tenant_ref: str) -> Optional[Tenant]:
+    """Resolve a tenant by UUID or slug (Keycloak sends the slug)."""
     try:
-        return db.query(Tenant).filter(Tenant.tenant_id == tenant_id).first()
-    except SQLAlchemyError as e:
-        logger.error(f"Error getting tenant {tenant_id}: {e}")
-        raise DatabaseError(f"Failed to get tenant: {e}")
-
-
-def verify_tenant_exists(db: Session, tenant_id: str) -> None:
-    """Verify tenant exists, raise error if not."""
-    tenant = get_tenant(db, tenant_id)
-    if not tenant:
-        raise NotFoundError(f"Tenant {tenant_id} not found")
-    if not tenant.is_active:
-        raise DatabaseError(f"Tenant {tenant_id} is not active")
+        tenant_uuid = UUID(tenant_ref)
+        condition = Tenant.tenant_id == tenant_uuid
+    except ValueError:
+        condition = Tenant.tenant_slug == tenant_ref.strip().lower()
+    return db.execute(select(Tenant).where(condition)).scalar_one_or_none()
 
 
 # ============================================================================
-# Document Operations
+# Documents
 # ============================================================================
 
-def create_document(db: Session, document: DocumentCreate) -> Document:
+def get_document(db: Session, tenant_id: UUID, document_id: UUID) -> Optional[Document]:
+    return db.execute(
+        select(Document).where(Document.tenant_id == tenant_id, Document.document_id == document_id)
+    ).scalar_one_or_none()
+
+
+def _require_document(db: Session, tenant_id: UUID, document_id: UUID, for_update: bool = False) -> Document:
+    query = select(Document).where(Document.tenant_id == tenant_id, Document.document_id == document_id)
+    if for_update:
+        query = query.with_for_update()
+    document = db.execute(query).scalar_one_or_none()
+    if document is None:
+        raise NotFoundError(f"Document {document_id} not found")
+    return document
+
+
+def get_current_document_version(db: Session, tenant_id: UUID, source_uri: str) -> Optional[Document]:
+    return db.execute(
+        select(Document).where(
+            Document.tenant_id == tenant_id,
+            Document.source_uri == source_uri,
+            Document.is_current_version.is_(True),
+            Document.status != DocumentStatus.DELETED,
+        )
+    ).scalar_one_or_none()
+
+
+def create_document(db: Session, tenant_id: UUID, data: DocumentCreate) -> Document:
     """
-    Create a new document.
-    
-    Args:
-        db: Database session
-        document: Document creation data
-        
-    Returns:
-        Created document
-        
-    Raises:
-        NotFoundError: If tenant doesn't exist
-        DuplicateError: If document with same checksum exists
-        DatabaseError: On other database errors
+    Create the first version of a document, or a new pending version of an
+    existing one. Identical content to the current version is rejected.
     """
+    current = db.execute(
+        select(Document)
+        .where(
+            Document.tenant_id == tenant_id,
+            Document.source_uri == data.source_uri,
+            Document.is_current_version.is_(True),
+            Document.status != DocumentStatus.DELETED,
+        )
+        .with_for_update()
+    ).scalar_one_or_none()
+
+    if current is not None and current.checksum == data.checksum:
+        raise DuplicateError("Document content is unchanged from the current version")
+
+    fields = data.model_dump(exclude={"version", "status", "tags"})
+    document = Document(tenant_id=tenant_id, tags=data.tags, **fields)
+
+    if current is None:
+        document.version_number = 1
+        document.version = data.version or "v1"
+        document.is_current_version = True
+        document.status = data.status
+    else:
+        document.version_number = current.version_number + 1
+        document.version = data.version or f"v{document.version_number}"
+        document.parent_document_id = current.document_id
+        # Stays non-current until activate_document() swaps it in.
+        document.is_current_version = False
+        document.status = DocumentStatus.PENDING if data.status == DocumentStatus.ACTIVE else data.status
+
+    db.add(document)
     try:
-        # Verify tenant exists
-        verify_tenant_exists(db, document.tenant_id)
-        
-        # Check for duplicate checksum in active documents
-        existing = db.query(Document).filter(
-            and_(
-                Document.tenant_id == document.tenant_id,
-                Document.checksum == document.checksum,
-                Document.status == 'active'
-            )
-        ).first()
-        
-        if existing:
-            raise DuplicateError(
-                f"Active document with checksum {document.checksum} already exists"
-            )
-        
-        # Create document
-        db_document = Document(**document.model_dump())
-        db.add(db_document)
         db.commit()
-        db.refresh(db_document)
-        
-        logger.info(f"Created document {db_document.document_id} for tenant {document.tenant_id}")
-        return db_document
-        
     except IntegrityError as e:
         db.rollback()
-        logger.error(f"Integrity error creating document: {e}")
-        raise DuplicateError(f"Document creation failed: {e}")
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error creating document: {e}")
-        raise DatabaseError(f"Failed to create document: {e}")
+        raise DuplicateError(f"Document conflicts with an existing record: {e.orig}") from e
+    db.refresh(document)
+
+    # A brand-new document may be created ACTIVE directly; a new version must
+    # go through activation so the swap is atomic.
+    if current is not None and data.status == DocumentStatus.ACTIVE:
+        document = activate_document(db, tenant_id, document.document_id)
+
+    logger.info("Created document %s v%s for tenant %s", document.document_id, document.version_number, tenant_id)
+    return document
 
 
-def get_document(db: Session, document_id: UUID) -> Optional[Document]:
-    """
-    Get document by ID.
-    
-    Args:
-        db: Database session
-        document_id: Document UUID
-        
-    Returns:
-        Document if found, None otherwise
-    """
+def activate_document(db: Session, tenant_id: UUID, document_id: UUID) -> Document:
+    """Make a version ACTIVE and current, archiving the previous current version."""
+    document = _require_document(db, tenant_id, document_id, for_update=True)
+    if document.status == DocumentStatus.DELETED:
+        raise ConflictError("Deleted documents cannot be activated")
+
+    previous = db.execute(
+        select(Document)
+        .where(
+            Document.tenant_id == tenant_id,
+            Document.source_uri == document.source_uri,
+            Document.is_current_version.is_(True),
+            Document.document_id != document.document_id,
+        )
+        .with_for_update()
+    ).scalars().all()
+
+    for old in previous:
+        old.is_current_version = False
+        if old.status != DocumentStatus.DELETED:
+            old.status = DocumentStatus.ARCHIVED
+    # Flush the demotion first so the one-current-version index never sees two.
+    db.flush()
+
+    document.is_current_version = True
+    document.status = DocumentStatus.ACTIVE
     try:
-        return db.query(Document).filter(
-            Document.document_id == document_id
-        ).first()
-    except SQLAlchemyError as e:
-        logger.error(f"Error getting document {document_id}: {e}")
-        raise DatabaseError(f"Failed to get document: {e}")
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise DuplicateError(f"Activation conflicts with an existing record: {e.orig}") from e
+    db.refresh(document)
+    return document
 
 
 def get_documents(
     db: Session,
-    tenant_id: str,
-    status: str = "active",
+    tenant_id: UUID,
+    status: Optional[DocumentStatus] = DocumentStatus.ACTIVE,
+    current_only: bool = True,
     limit: int = 100,
-    offset: int = 0
+    offset: int = 0,
 ) -> Tuple[List[Document], int]:
-    """
-    Get documents with pagination.
-    
-    Args:
-        db: Database session
-        tenant_id: Tenant ID
-        status: Document status filter
-        limit: Maximum number of documents to return
-        offset: Number of documents to skip
-        
-    Returns:
-        Tuple of (documents list, total count)
-    """
-    try:
-        # Build query
-        query = db.query(Document).filter(
-            and_(
-                Document.tenant_id == tenant_id,
-                Document.status == status
-            )
-        )
-        
-        # Get total count
-        total = query.count()
-        
-        # Get paginated results
-        documents = query.order_by(
-            Document.created_at.desc()
-        ).limit(limit).offset(offset).all()
-        
-        return documents, total
-        
-    except SQLAlchemyError as e:
-        logger.error(f"Error getting documents: {e}")
-        raise DatabaseError(f"Failed to get documents: {e}")
+    conditions = [Document.tenant_id == tenant_id]
+    if status is not None:
+        conditions.append(Document.status == status)
+    if current_only:
+        conditions.append(Document.is_current_version.is_(True))
+
+    query = db.query(Document).filter(and_(*conditions))
+    total = query.count()
+    documents = query.order_by(Document.created_at.desc()).limit(limit).offset(offset).all()
+    return documents, total
 
 
-def update_document(
-    db: Session,
-    document_id: UUID,
-    updates: DocumentUpdate
-) -> Document:
-    """
-    Update document.
-    
-    Args:
-        db: Database session
-        document_id: Document UUID
-        updates: Update data
-        
-    Returns:
-        Updated document
-        
-    Raises:
-        NotFoundError: If document doesn't exist
-        DatabaseError: On database errors
-    """
-    try:
-        document = get_document(db, document_id)
-        if not document:
-            raise NotFoundError(f"Document {document_id} not found")
-        
-        # Apply updates
-        update_data = updates.model_dump(exclude_unset=True)
-        for field, value in update_data.items():
-            setattr(document, field, value)
-        
-        db.commit()
-        db.refresh(document)
-        
-        logger.info(f"Updated document {document_id}")
-        return document
-        
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error updating document {document_id}: {e}")
-        raise DatabaseError(f"Failed to update document: {e}")
+def update_document(db: Session, tenant_id: UUID, document_id: UUID, updates: DocumentUpdate) -> Document:
+    document = _require_document(db, tenant_id, document_id, for_update=True)
+    changes = updates.model_dump(exclude_unset=True)
+
+    for field, value in changes.items():
+        setattr(document, field, value)
+
+    # Chunks carry a copy of the access metadata for retrieval pre-filtering;
+    # keep them in sync so a reclassification is never stale.
+    inherited = {k: changes[k] for k in ("classification", "department", "region") if k in changes}
+    if inherited:
+        db.query(DocumentChunk).filter(
+            DocumentChunk.tenant_id == tenant_id, DocumentChunk.document_id == document_id
+        ).update(inherited, synchronize_session=False)
+
+    db.commit()
+    db.refresh(document)
+    return document
 
 
-def delete_document(db: Session, document_id: UUID) -> bool:
-    """
-    Delete document (soft delete by setting status).
-    
-    Args:
-        db: Database session
-        document_id: Document UUID
-        
-    Returns:
-        True if deleted, False if not found
-    """
-    try:
-        document = get_document(db, document_id)
-        if not document:
-            return False
-        
-        document.status = 'deleted'
-        db.commit()
-        
-        logger.info(f"Deleted document {document_id}")
-        return True
-        
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error deleting document {document_id}: {e}")
-        raise DatabaseError(f"Failed to delete document: {e}")
+def mark_document_archived(db: Session, tenant_id: UUID, document_id: UUID) -> Document:
+    document = _require_document(db, tenant_id, document_id, for_update=True)
+    if document.status == DocumentStatus.DELETED:
+        raise ConflictError("Deleted documents cannot be archived")
+    document.status = DocumentStatus.ARCHIVED
+    db.commit()
+    db.refresh(document)
+    return document
 
 
-def mark_document_archived(db: Session, document_id: UUID) -> bool:
-    """
-    Archive document.
-    
-    Args:
-        db: Database session
-        document_id: Document UUID
-        
-    Returns:
-        True if archived, False if not found
-    """
-    try:
-        document = get_document(db, document_id)
-        if not document:
-            return False
-        
-        document.status = 'archived'
-        db.commit()
-        
-        logger.info(f"Archived document {document_id}")
-        return True
-        
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error archiving document {document_id}: {e}")
-        raise DatabaseError(f"Failed to archive document: {e}")
+def mark_document_deleted(db: Session, tenant_id: UUID, document_id: UUID) -> Document:
+    """Soft delete: excluded from every retrieval path immediately."""
+    document = _require_document(db, tenant_id, document_id, for_update=True)
+    document.status = DocumentStatus.DELETED
+    document.is_current_version = False
+    db.commit()
+    db.refresh(document)
+    return document
+
+
+def list_document_versions(db: Session, tenant_id: UUID, document_id: UUID) -> List[Document]:
+    document = _require_document(db, tenant_id, document_id)
+    return db.execute(
+        select(Document)
+        .where(Document.tenant_id == tenant_id, Document.source_uri == document.source_uri)
+        .order_by(Document.version_number.desc())
+    ).scalars().all()
 
 
 # ============================================================================
-# Chunk Operations
+# Chunks
 # ============================================================================
 
-def create_chunk(db: Session, chunk: ChunkCreate) -> DocumentChunk:
-    """
-    Create a new chunk.
-    
-    Args:
-        db: Database session
-        chunk: Chunk creation data
-        
-    Returns:
-        Created chunk
-        
-    Raises:
-        NotFoundError: If document doesn't exist
-        DatabaseError: On database errors
-    """
+def _build_chunk(tenant_id: UUID, document: Document, data: ChunkCreate) -> DocumentChunk:
+    checksum = sha256_hex(data.chunk_text)
+    if data.checksum is not None and data.checksum.lower() != checksum:
+        raise ConflictError(f"Checksum mismatch for chunk_index {data.chunk_index}")
+    return DocumentChunk(
+        tenant_id=tenant_id,
+        document_id=document.document_id,
+        chunk_text=data.chunk_text,
+        chunk_index=data.chunk_index,
+        token_count=data.token_count,
+        checksum=checksum,
+        page_start=data.page_start,
+        page_end=data.page_end,
+        section_title=data.section_title,
+        heading_path=data.heading_path,
+        chunk_type=data.chunk_type,
+        # Access metadata always comes from the document, never the caller, so
+        # a chunk can never cross a classification boundary.
+        classification=document.classification,
+        department=document.department,
+        region=document.region,
+        language=document.language,
+    )
+
+
+def create_chunk(db: Session, tenant_id: UUID, data: ChunkCreate) -> DocumentChunk:
+    return bulk_create_chunks(db, tenant_id, [data])[0]
+
+
+def bulk_create_chunks(db: Session, tenant_id: UUID, chunks: Sequence[ChunkCreate]) -> List[DocumentChunk]:
+    """Create chunks for a single document atomically (all or nothing)."""
+    if not chunks:
+        return []
+    document_ids = {chunk.document_id for chunk in chunks}
+    if len(document_ids) > 1:
+        raise ConflictError("All chunks in a batch must belong to the same document")
+
+    document = _require_document(db, tenant_id, chunks[0].document_id)
+    if document.status in (DocumentStatus.DELETED, DocumentStatus.ARCHIVED):
+        raise ConflictError(f"Cannot add chunks to a {document.status.value} document")
+
+    db_chunks = [_build_chunk(tenant_id, document, chunk) for chunk in chunks]
+    db.add_all(db_chunks)
     try:
-        # Verify document exists
-        document = get_document(db, chunk.document_id)
-        if not document:
-            raise NotFoundError(f"Document {chunk.document_id} not found")
-        
-        # Verify tenant matches
-        if document.tenant_id != chunk.tenant_id:
-            raise TenantMismatchError(
-                f"Chunk tenant {chunk.tenant_id} doesn't match document tenant {document.tenant_id}"
-            )
-        
-        # Create chunk
-        db_chunk = DocumentChunk(**chunk.model_dump())
-        db.add(db_chunk)
         db.commit()
-        db.refresh(db_chunk)
-        
-        logger.info(f"Created chunk {db_chunk.chunk_id} for document {chunk.document_id}")
-        return db_chunk
-        
     except IntegrityError as e:
         db.rollback()
-        logger.error(f"Integrity error creating chunk: {e}")
-        raise DuplicateError(f"Chunk creation failed: {e}")
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error creating chunk: {e}")
-        raise DatabaseError(f"Failed to create chunk: {e}")
+        raise DuplicateError(f"Chunk conflicts with an existing record: {e.orig}") from e
+    for chunk in db_chunks:
+        db.refresh(chunk)
+    return db_chunks
 
 
-def bulk_create_chunks(
-    db: Session,
-    chunks: List[ChunkCreate],
-    batch_size: int = 1000
-) -> List[DocumentChunk]:
-    """
-    Bulk create chunks with batching.
-    
-    Args:
-        db: Database session
-        chunks: List of chunk creation data
-        batch_size: Number of chunks per batch
-        
-    Returns:
-        List of created chunks
-        
-    Raises:
-        NotFoundError: If document doesn't exist
-        DatabaseError: On database errors
-    """
-    try:
-        if not chunks:
-            return []
-        
-        # Verify all chunks belong to same document
-        document_ids = set(chunk.document_id for chunk in chunks)
-        if len(document_ids) > 1:
-            raise DatabaseError("All chunks must belong to the same document")
-        
-        document_id = chunks[0].document_id
-        tenant_id = chunks[0].tenant_id
-        
-        # Verify document exists
-        document = get_document(db, document_id)
-        if not document:
-            raise NotFoundError(f"Document {document_id} not found")
-        
-        # Verify tenant matches
-        if document.tenant_id != tenant_id:
-            raise TenantMismatchError(
-                f"Chunk tenant {tenant_id} doesn't match document tenant {document.tenant_id}"
-            )
-        
-        created_chunks = []
-        
-        # Process in batches
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i:i + batch_size]
-            db_chunks = [DocumentChunk(**chunk.model_dump()) for chunk in batch]
-            db.bulk_save_objects(db_chunks, return_defaults=True)
-            db.commit()
-            created_chunks.extend(db_chunks)
-            
-            logger.info(f"Created batch of {len(db_chunks)} chunks for document {document_id}")
-        
-        return created_chunks
-        
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error bulk creating chunks: {e}")
-        raise DatabaseError(f"Failed to bulk create chunks: {e}")
-
-
-def get_chunk(db: Session, chunk_id: UUID) -> Optional[DocumentChunk]:
-    """
-    Get chunk by ID.
-    
-    Args:
-        db: Database session
-        chunk_id: Chunk UUID
-        
-    Returns:
-        Chunk if found, None otherwise
-    """
-    try:
-        return db.query(DocumentChunk).filter(
-            DocumentChunk.chunk_id == chunk_id
-        ).first()
-    except SQLAlchemyError as e:
-        logger.error(f"Error getting chunk {chunk_id}: {e}")
-        raise DatabaseError(f"Failed to get chunk: {e}")
+def get_chunk(db: Session, tenant_id: UUID, chunk_id: UUID) -> Optional[DocumentChunk]:
+    return db.execute(
+        select(DocumentChunk).where(DocumentChunk.tenant_id == tenant_id, DocumentChunk.chunk_id == chunk_id)
+    ).scalar_one_or_none()
 
 
 def get_chunks_by_ids(
     db: Session,
-    chunk_ids: List[UUID]
-) -> List[DocumentChunk]:
+    tenant_id: UUID,
+    chunk_ids: Sequence[UUID],
+    include_inactive: bool = False,
+) -> Tuple[List[Tuple[DocumentChunk, Document]], List[UUID]]:
     """
-    Get multiple chunks by IDs.
-    
-    Args:
-        db: Database session
-        chunk_ids: List of chunk UUIDs
-        
-    Returns:
-        List of chunks (may be fewer than requested if some not found)
+    Resolve chunk IDs (e.g. from Qdrant/BM25/KG) to canonical records, in the
+    order requested. By default only chunks of ACTIVE, current document
+    versions are returned; everything else is reported as missing.
     """
-    try:
-        if not chunk_ids:
-            return []
-        
-        return db.query(DocumentChunk).filter(
-            DocumentChunk.chunk_id.in_(chunk_ids)
-        ).all()
-        
-    except SQLAlchemyError as e:
-        logger.error(f"Error getting chunks by IDs: {e}")
-        raise DatabaseError(f"Failed to get chunks: {e}")
+    if not chunk_ids:
+        return [], []
+
+    conditions = [DocumentChunk.tenant_id == tenant_id, DocumentChunk.chunk_id.in_(list(chunk_ids))]
+    if not include_inactive:
+        conditions += [Document.status == DocumentStatus.ACTIVE, Document.is_current_version.is_(True)]
+
+    rows = db.execute(
+        select(DocumentChunk, Document)
+        .join(Document, and_(Document.document_id == DocumentChunk.document_id,
+                             Document.tenant_id == DocumentChunk.tenant_id))
+        .where(*conditions)
+    ).all()
+
+    by_id = {chunk.chunk_id: (chunk, document) for chunk, document in rows}
+    ordered, missing, seen = [], [], set()
+    for chunk_id in chunk_ids:
+        if chunk_id in seen:
+            continue
+        seen.add(chunk_id)
+        if chunk_id in by_id:
+            ordered.append(by_id[chunk_id])
+        else:
+            missing.append(chunk_id)
+    return ordered, missing
 
 
 def get_chunks_by_document(
-    db: Session,
-    document_id: UUID,
-    limit: int = 1000,
-    offset: int = 0
+    db: Session, tenant_id: UUID, document_id: UUID, limit: int = 1000, offset: int = 0
 ) -> Tuple[List[DocumentChunk], int]:
-    """
-    Get chunks for a document with pagination.
-    
-    Args:
-        db: Database session
-        document_id: Document UUID
-        limit: Maximum number of chunks to return
-        offset: Number of chunks to skip
-        
-    Returns:
-        Tuple of (chunks list, total count)
-    """
-    try:
-        # Build query
-        query = db.query(DocumentChunk).filter(
-            DocumentChunk.document_id == document_id
-        )
-        
-        # Get total count
-        total = query.count()
-        
-        # Get paginated results
-        chunks = query.order_by(
-            DocumentChunk.chunk_index
-        ).limit(limit).offset(offset).all()
-        
-        return chunks, total
-        
-    except SQLAlchemyError as e:
-        logger.error(f"Error getting chunks for document {document_id}: {e}")
-        raise DatabaseError(f"Failed to get chunks: {e}")
+    _require_document(db, tenant_id, document_id)
+    query = db.query(DocumentChunk).filter(
+        DocumentChunk.tenant_id == tenant_id, DocumentChunk.document_id == document_id
+    )
+    total = query.count()
+    chunks = query.order_by(DocumentChunk.chunk_index).limit(limit).offset(offset).all()
+    return chunks, total
 
 
 # ============================================================================
-# Version Operations
+# Retrieval audit + feedback
 # ============================================================================
 
-def create_document_version(
-    db: Session,
-    document_id: UUID,
-    tenant_id: str,
-    version: str
-) -> DocumentVersion:
-    """
-    Create a new document version.
-    
-    Args:
-        db: Database session
-        document_id: Document UUID
-        tenant_id: Tenant ID
-        version: Version string
-        
-    Returns:
-        Created version
-        
-    Raises:
-        NotFoundError: If document doesn't exist
-        DatabaseError: On database errors
-    """
-    try:
-        # Verify document exists
-        document = get_document(db, document_id)
-        if not document:
-            raise NotFoundError(f"Document {document_id} not found")
-        
-        # Verify tenant matches
-        if document.tenant_id != tenant_id:
-            raise TenantMismatchError(
-                f"Version tenant {tenant_id} doesn't match document tenant {document.tenant_id}"
-            )
-        
-        # Mark all existing versions as not current
-        db.query(DocumentVersion).filter(
-            and_(
-                DocumentVersion.document_id == document_id,
-                DocumentVersion.is_current == True
-            )
-        ).update({"is_current": False})
-        
-        # Create new version
-        db_version = DocumentVersion(
-            document_id=document_id,
-            tenant_id=tenant_id,
-            version=version,
-            is_current=True
+def create_retrieval_audit(
+    db: Session, tenant_id: UUID, data: RetrievalAuditCreate, store_query_text: bool
+) -> RetrievalAuditLog:
+    fields = data.model_dump(exclude={"query"})
+    record = RetrievalAuditLog(
+        tenant_id=tenant_id,
+        query_hash=sha256_hex(data.query),
+        query_text=data.query if store_query_text else None,
+        **fields,
+    )
+    record.retrieval_sources = {str(k): v for k, v in data.retrieval_sources.items()}
+    db.add(record)
+    db.commit()
+    db.refresh(record)
+    return record
+
+
+def get_retrieval_audit(db: Session, tenant_id: UUID, audit_id: UUID) -> Optional[RetrievalAuditLog]:
+    return db.execute(
+        select(RetrievalAuditLog).where(
+            RetrievalAuditLog.tenant_id == tenant_id, RetrievalAuditLog.audit_id == audit_id
         )
-        db.add(db_version)
-        db.commit()
-        db.refresh(db_version)
-        
-        logger.info(f"Created version {version} for document {document_id}")
-        return db_version
-        
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Error creating document version: {e}")
-        raise DatabaseError(f"Failed to create version: {e}")
+    ).scalar_one_or_none()
 
 
-def get_current_version(
-    db: Session,
-    document_id: UUID
-) -> Optional[DocumentVersion]:
-    """
-    Get current version of a document.
-    
-    Args:
-        db: Database session
-        document_id: Document UUID
-        
-    Returns:
-        Current version if found, None otherwise
-    """
+def create_feedback(db: Session, tenant_id: UUID, data: FeedbackCreate) -> UserFeedback:
+    audit = get_retrieval_audit(db, tenant_id, data.audit_id)
+    if audit is None:
+        raise NotFoundError(f"Answer {data.audit_id} not found")
+    if audit.user_id != data.user_id:
+        # Only the person who received the answer can rate it.
+        raise ConflictError("Feedback must come from the user who received the answer")
+    # Chunk-level feedback may only reference what the user was shown.
+    shown = set(audit.context_chunk_ids or [])
+    if not set(data.helpful_chunk_ids + data.unhelpful_chunk_ids) <= shown:
+        raise ConflictError("Chunk feedback may only reference chunks that were in the answer context")
+
+    feedback = UserFeedback(tenant_id=tenant_id, **data.model_dump())
+    db.add(feedback)
     try:
-        return db.query(DocumentVersion).filter(
-            and_(
-                DocumentVersion.document_id == document_id,
-                DocumentVersion.is_current == True
-            )
-        ).first()
-    except SQLAlchemyError as e:
-        logger.error(f"Error getting current version for document {document_id}: {e}")
-        raise DatabaseError(f"Failed to get current version: {e}")
-
-
-def archive_old_versions(
-    db: Session,
-    document_id: UUID,
-    current_version: str
-) -> int:
-    """
-    Archive old versions of a document.
-    
-    Args:
-        db: Database session
-        document_id: Document UUID
-        current_version: Current version string
-        
-    Returns:
-        Number of versions archived
-    """
-    try:
-        result = db.query(DocumentVersion).filter(
-            and_(
-                DocumentVersion.document_id == document_id,
-                DocumentVersion.version != current_version,
-                DocumentVersion.is_current == True
-            )
-        ).update({"is_current": False})
-        
         db.commit()
-        
-        logger.info(f"Archived {result} old versions for document {document_id}")
-        return result
-        
-    except SQLAlchemyError as e:
+    except IntegrityError as e:
         db.rollback()
-        logger.error(f"Error archiving old versions: {e}")
-        raise DatabaseError(f"Failed to archive versions: {e}")
-
-# Made with Bob
+        raise DuplicateError("Feedback already recorded for this answer") from e
+    db.refresh(feedback)
+    return feedback

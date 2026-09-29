@@ -1,44 +1,43 @@
 """
 Database connection and session management.
 Implements connection pooling and Row-Level Security (RLS) support.
+
+RLS policies read `app.current_tenant_id`. It is set with SET LOCAL, which
+only lasts for the current transaction, so it is re-applied at the start of
+every transaction a session opens (including after each commit). Queries in a
+session without a tenant see no tenant-owned rows when connected as the
+non-superuser application role.
 """
 
-from contextlib import contextmanager
-from typing import Generator
-from sqlalchemy import create_engine, event, text
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import sessionmaker, Session
-from sqlalchemy.pool import QueuePool
-import redis
 import logging
+from typing import Generator
+from uuid import UUID
+
+import redis
+from sqlalchemy import create_engine, event, text
+from sqlalchemy.orm import Session, declarative_base, sessionmaker
+from sqlalchemy.pool import QueuePool
 
 from app.config import settings
 
-# Configure logging
 logger = logging.getLogger(__name__)
 
-# Create SQLAlchemy engine with connection pooling
+TENANT_INFO_KEY = "tenant_id"
+
 engine = create_engine(
     settings.database_url,
     poolclass=QueuePool,
     pool_size=settings.db_pool_size,
     max_overflow=settings.db_max_overflow,
     pool_timeout=settings.db_pool_timeout,
-    pool_pre_ping=True,  # Verify connections before using
+    pool_pre_ping=True,
     echo=settings.db_echo,
 )
 
-# Create session factory
-SessionLocal = sessionmaker(
-    autocommit=False,
-    autoflush=False,
-    bind=engine
-)
+SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Create declarative base for models
 Base = declarative_base()
 
-# Redis connection
 redis_client = redis.from_url(
     settings.redis_url,
     decode_responses=True,
@@ -47,46 +46,33 @@ redis_client = redis.from_url(
 )
 
 
-def get_db() -> Generator[Session, None, None]:
-    """
-    Dependency for FastAPI to get database session.
-    Automatically closes session after request.
-    """
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-def set_tenant_context(db: Session, tenant_id: str) -> None:
-    """
-    Set tenant context for Row-Level Security (RLS).
-    Must be called before any queries when RLS is enabled.
-    """
-    if settings.rls_enabled:
-        db.execute(
-            text("SET LOCAL app.current_tenant_id = :tenant_id"),
-            {"tenant_id": tenant_id}
+@event.listens_for(Session, "after_begin")
+def _apply_tenant_context(session: Session, transaction, connection) -> None:
+    """Re-apply the tenant RLS context at the start of every transaction."""
+    tenant_id = session.info.get(TENANT_INFO_KEY)
+    if tenant_id is not None:
+        connection.execute(
+            text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
+            {"tenant_id": str(tenant_id)},
         )
-        logger.debug(f"Set tenant context: {tenant_id}")
 
 
-@contextmanager
-def get_db_with_tenant(tenant_id: str) -> Generator[Session, None, None]:
-    """
-    Context manager for database session with tenant context.
-    Automatically sets RLS tenant context and closes session.
-    """
+def set_tenant_context(db: Session, tenant_id: UUID) -> None:
+    """Bind a session to a tenant for the rest of its lifetime."""
+    db.info[TENANT_INFO_KEY] = str(tenant_id)
+    if db.in_transaction():
+        # A transaction is already open, so after_begin has fired; apply now.
+        db.execute(
+            text("SELECT set_config('app.current_tenant_id', :tenant_id, true)"),
+            {"tenant_id": str(tenant_id)},
+        )
+
+
+def get_db() -> Generator[Session, None, None]:
+    """FastAPI dependency: database session closed after the request."""
     db = SessionLocal()
     try:
-        set_tenant_context(db, tenant_id)
         yield db
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error: {e}")
-        raise
     finally:
         db.close()
 
@@ -97,10 +83,7 @@ def get_redis() -> redis.Redis:
 
 
 def check_database_connection() -> bool:
-    """
-    Check if database connection is healthy.
-    Used for health checks.
-    """
+    """Check if database connection is healthy."""
     try:
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
@@ -111,10 +94,7 @@ def check_database_connection() -> bool:
 
 
 def check_redis_connection() -> bool:
-    """
-    Check if Redis connection is healthy.
-    Used for health checks.
-    """
+    """Check if Redis connection is healthy."""
     try:
         redis_client.ping()
         return True
@@ -123,22 +103,10 @@ def check_redis_connection() -> bool:
         return False
 
 
-# Event listeners for connection lifecycle
-@event.listens_for(engine, "connect")
-def receive_connect(dbapi_conn, connection_record):
-    """Log new database connections."""
-    logger.debug("New database connection established")
-
-
-@event.listens_for(engine, "checkout")
-def receive_checkout(dbapi_conn, connection_record, connection_proxy):
-    """Log connection checkout from pool."""
-    logger.debug("Connection checked out from pool")
-
-
-@event.listens_for(engine, "checkin")
-def receive_checkin(dbapi_conn, connection_record):
-    """Log connection return to pool."""
-    logger.debug("Connection returned to pool")
-
-# Made with Bob
+def ensure_audit_partitions(months_ahead: int = 3) -> None:
+    """Create upcoming audit_logs partitions (best effort, run at startup)."""
+    try:
+        with engine.begin() as conn:
+            conn.execute(text("SELECT ensure_audit_partitions(:m)"), {"m": months_ahead})
+    except Exception as e:
+        logger.warning(f"Could not ensure audit partitions: {e}")

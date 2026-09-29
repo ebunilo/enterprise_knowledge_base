@@ -1,13 +1,19 @@
 """
-OIDC/OAuth2 client for token validation.
+OIDC (Keycloak) access-token validation.
 
-This module handles OIDC token validation, JWT parsing,
-and user claims extraction from Keycloak.
+A token is accepted only if:
+  * it is signed by a key in the provider's JWKS with an allowed algorithm,
+  * `iss` equals the discovered issuer and `exp` has not passed,
+  * it is an access token (Keycloak `typ` = "Bearer"), not an ID token,
+  * `aud` contains an accepted audience, or `azp` is the client (Keycloak
+    access tokens do not include the client in `aud` unless an Audience
+    mapper is configured).
 """
 
+import hashlib
 import json
 import logging
-from datetime import datetime, timedelta
+import time
 from typing import Dict, Optional
 
 import httpx
@@ -19,301 +25,137 @@ from app.database import cache_get, cache_set
 logger = logging.getLogger(__name__)
 
 
-# ============================================================================
-# OIDC Configuration
-# ============================================================================
-
 class OIDCConfig:
-    """OIDC provider configuration."""
-    
+    """OIDC provider configuration discovered from the well-known endpoint."""
+
     def __init__(self):
-        self.provider_url = settings.oidc_provider_url
-        self.client_id = settings.oidc_client_id
-        self.client_secret = settings.oidc_client_secret
-        self.jwks_cache_ttl = settings.oidc_jwks_cache_ttl
-        
-        # Derived URLs
+        self.provider_url = settings.oidc_provider_url.rstrip("/")
         self.well_known_url = f"{self.provider_url}/.well-known/openid-configuration"
         self.jwks_uri: Optional[str] = None
         self.issuer: Optional[str] = None
-        self.authorization_endpoint: Optional[str] = None
         self.token_endpoint: Optional[str] = None
-        self.userinfo_endpoint: Optional[str] = None
-    
+        self.introspection_endpoint: Optional[str] = None
+
+    def _apply(self, config: dict) -> None:
+        self.jwks_uri = config["jwks_uri"]
+        self.issuer = config["issuer"]
+        self.token_endpoint = config.get("token_endpoint")
+        self.introspection_endpoint = config.get("introspection_endpoint")
+
     async def load_configuration(self) -> bool:
-        """
-        Load OIDC provider configuration from well-known endpoint.
-        
-        Returns:
-            True if successful, False otherwise
-        """
+        cache_key = f"oidc:config:{self.provider_url}"
         try:
-            # Check cache first
-            cache_key = f"oidc:config:{self.provider_url}"
             cached = cache_get(cache_key)
-            
             if cached:
-                config = json.loads(cached)
-                self.jwks_uri = config["jwks_uri"]
-                self.issuer = config["issuer"]
-                self.authorization_endpoint = config.get("authorization_endpoint")
-                self.token_endpoint = config.get("token_endpoint")
-                self.userinfo_endpoint = config.get("userinfo_endpoint")
-                logger.debug("Loaded OIDC configuration from cache")
+                self._apply(json.loads(cached))
                 return True
-            
-            # Fetch from provider
             async with httpx.AsyncClient() as client:
                 response = await client.get(self.well_known_url, timeout=10.0)
                 response.raise_for_status()
                 config = response.json()
-            
-            self.jwks_uri = config["jwks_uri"]
-            self.issuer = config["issuer"]
-            self.authorization_endpoint = config.get("authorization_endpoint")
-            self.token_endpoint = config.get("token_endpoint")
-            self.userinfo_endpoint = config.get("userinfo_endpoint")
-            
-            # Cache configuration
+            self._apply(config)
             cache_set(cache_key, json.dumps(config), ttl=3600)
-            
-            logger.info(f"Loaded OIDC configuration from {self.well_known_url}")
+            logger.info("Loaded OIDC configuration from %s", self.well_known_url)
             return True
-            
         except Exception as e:
-            logger.error(f"Failed to load OIDC configuration: {e}")
+            logger.error("Failed to load OIDC configuration from %s: %s", self.well_known_url, e)
             return False
 
 
-# Global OIDC config instance
 oidc_config = OIDCConfig()
 
 
-# ============================================================================
-# JWKS Management
-# ============================================================================
-
-async def get_jwks() -> Optional[Dict]:
-    """
-    Get JSON Web Key Set from OIDC provider.
-    
-    Returns:
-        JWKS dictionary or None if failed
-    """
+async def get_jwks(force_refresh: bool = False) -> Optional[Dict]:
+    """JSON Web Key Set, cached; `force_refresh` handles key rotation."""
+    if not oidc_config.jwks_uri and not await oidc_config.load_configuration():
+        return None
+    cache_key = f"oidc:jwks:{oidc_config.provider_url}"
     try:
-        # Ensure configuration is loaded
-        if not oidc_config.jwks_uri:
-            await oidc_config.load_configuration()
-        
-        if not oidc_config.jwks_uri:
-            logger.error("JWKS URI not available")
-            return None
-        
-        # Check cache first
-        cache_key = f"oidc:jwks:{oidc_config.provider_url}"
-        cached = cache_get(cache_key)
-        
-        if cached:
-            logger.debug("Loaded JWKS from cache")
-            return json.loads(cached)
-        
-        # Fetch from provider
+        if not force_refresh:
+            cached = cache_get(cache_key)
+            if cached:
+                return json.loads(cached)
         async with httpx.AsyncClient() as client:
             response = await client.get(oidc_config.jwks_uri, timeout=10.0)
             response.raise_for_status()
             jwks = response.json()
-        
-        # Cache JWKS
-        cache_set(cache_key, json.dumps(jwks), ttl=oidc_config.jwks_cache_ttl)
-        
-        logger.info("Fetched JWKS from provider")
+        cache_set(cache_key, json.dumps(jwks), ttl=settings.oidc_jwks_cache_ttl)
         return jwks
-        
     except Exception as e:
-        logger.error(f"Failed to get JWKS: {e}")
+        logger.error("Failed to get JWKS: %s", e)
         return None
 
 
-# ============================================================================
-# Token Validation
-# ============================================================================
+def _find_key(jwks: Optional[Dict], kid: str) -> Optional[Dict]:
+    for key in (jwks or {}).get("keys", []):
+        if key.get("kid") == kid:
+            return key
+    return None
+
+
+def _audience_ok(claims: Dict) -> bool:
+    accepted = set(settings.accepted_audiences)
+    aud = claims.get("aud")
+    audiences = {aud} if isinstance(aud, str) else set(aud or [])
+    if audiences & accepted:
+        return True
+    return settings.oidc_accept_azp and claims.get("azp") in accepted
+
 
 async def validate_token(token: str) -> Optional[Dict]:
-    """
-    Validate JWT token and extract claims.
-    
-    Args:
-        token: JWT token string
-        
-    Returns:
-        Token claims dictionary or None if invalid
-    """
+    """Validate an access token; returns its claims or None."""
     try:
-        # Get JWKS
-        jwks = await get_jwks()
-        if not jwks:
-            logger.error("Cannot validate token: JWKS not available")
-            return None
-        
-        # Decode token header to get key ID
-        unverified_header = jwt.get_unverified_header(token)
-        kid = unverified_header.get("kid")
-        
-        if not kid:
-            logger.warning("Token missing key ID (kid)")
-            return None
-        
-        # Find matching key in JWKS
-        key = None
-        for jwk in jwks.get("keys", []):
-            if jwk.get("kid") == kid:
-                key = jwk
-                break
-        
-        if not key:
-            logger.warning(f"No matching key found for kid: {kid}")
-            return None
-        
-        # Verify and decode token
+        header = jwt.get_unverified_header(token)
+    except JWTError as e:
+        logger.warning("Malformed token: %s", e)
+        return None
+
+    kid = header.get("kid")
+    if not kid or header.get("alg") not in settings.allowed_algorithms:
+        logger.warning("Token rejected: missing kid or disallowed alg %r", header.get("alg"))
+        return None
+
+    key = _find_key(await get_jwks(), kid)
+    if key is None:
+        # Keycloak rotated its keys since we cached the JWKS.
+        key = _find_key(await get_jwks(force_refresh=True), kid)
+    if key is None:
+        logger.warning("No signing key found for kid %s", kid)
+        return None
+
+    try:
         claims = jwt.decode(
             token,
             key,
-            algorithms=["RS256"],
-            audience=settings.oidc_client_id,
+            algorithms=settings.allowed_algorithms,
             issuer=oidc_config.issuer,
-            options={
-                "verify_signature": True,
-                "verify_aud": True,
-                "verify_iss": True,
-                "verify_exp": True
-            }
+            options={"verify_aud": False, "verify_exp": True, "verify_iss": True, "require_exp": True},
         )
-        
-        logger.debug(f"Token validated successfully for user: {claims.get('sub')}")
-        return claims
-        
     except JWTError as e:
-        logger.warning(f"JWT validation failed: {e}")
+        logger.warning("JWT validation failed: %s", e)
         return None
-    except Exception as e:
-        logger.error(f"Token validation error: {e}")
+
+    if claims.get("typ") not in (None, "Bearer"):
+        logger.warning("Token rejected: typ %r is not an access token", claims.get("typ"))
         return None
+    if not _audience_ok(claims):
+        logger.warning("Token rejected: audience %r / azp %r not accepted", claims.get("aud"), claims.get("azp"))
+        return None
+    return claims
 
 
 async def validate_token_cached(token: str) -> Optional[Dict]:
-    """
-    Validate JWT token with caching.
-    
-    Args:
-        token: JWT token string
-        
-    Returns:
-        Token claims dictionary or None if invalid
-    """
-    try:
-        # Create cache key from token hash
-        import hashlib
-        token_hash = hashlib.sha256(token.encode()).hexdigest()[:16]
-        cache_key = f"oidc:token:{token_hash}"
-        
-        # Check cache
-        cached = cache_get(cache_key)
-        if cached:
-            logger.debug("Token validation result from cache")
-            return json.loads(cached)
-        
-        # Validate token
-        claims = await validate_token(token)
-        
-        if claims:
-            # Cache valid token claims (short TTL for security)
-            exp = claims.get("exp")
-            if exp:
-                # Cache until token expiry or max 5 minutes
-                now = datetime.utcnow().timestamp()
-                ttl = min(int(exp - now), 300)
-                if ttl > 0:
-                    cache_set(cache_key, json.dumps(claims), ttl=ttl)
-        
-        return claims
-        
-    except Exception as e:
-        logger.error(f"Cached token validation error: {e}")
-        return None
+    """validate_token with a short-lived cache keyed by the full token hash."""
+    cache_key = f"oidc:token:{hashlib.sha256(token.encode()).hexdigest()}"
+    cached = cache_get(cache_key)
+    if cached:
+        claims = json.loads(cached)
+        if claims.get("exp", 0) > time.time():
+            return claims
 
-
-# ============================================================================
-# User Claims Extraction
-# ============================================================================
-
-def extract_user_claims(token_claims: Dict) -> Dict:
-    """
-    Extract user claims from JWT token.
-    
-    Args:
-        token_claims: Decoded JWT claims
-        
-    Returns:
-        Normalized user claims dictionary
-    """
-    return {
-        "user_id": token_claims.get("sub"),
-        "email": token_claims.get("email"),
-        "tenant_id": token_claims.get("tenant_id"),
-        "department": token_claims.get("department"),
-        "groups": token_claims.get("groups", []),
-        "role": token_claims.get("role"),
-        "region": token_claims.get("region"),
-        "country": token_claims.get("country"),
-        "clearance": token_claims.get("clearance", "INTERNAL_GENERAL"),
-        "is_employee": token_claims.get("is_employee", True),
-        "exp": token_claims.get("exp"),
-        "iat": token_claims.get("iat")
-    }
-
-
-# ============================================================================
-# Token Introspection (Optional)
-# ============================================================================
-
-async def introspect_token(token: str) -> Optional[Dict]:
-    """
-    Introspect token using OIDC introspection endpoint.
-    
-    This is an alternative to JWT validation for opaque tokens.
-    
-    Args:
-        token: Token string
-        
-    Returns:
-        Introspection result or None if failed
-    """
-    try:
-        if not oidc_config.token_endpoint:
-            await oidc_config.load_configuration()
-        
-        introspection_url = oidc_config.token_endpoint.replace("/token", "/introspect")
-        
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                introspection_url,
-                data={
-                    "token": token,
-                    "client_id": settings.oidc_client_id,
-                    "client_secret": settings.oidc_client_secret
-                },
-                timeout=10.0
-            )
-            response.raise_for_status()
-            result = response.json()
-        
-        if result.get("active"):
-            return result
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Token introspection failed: {e}")
-        return None
-
-# Made with Bob
+    claims = await validate_token(token)
+    if claims:
+        ttl = min(int(claims["exp"] - time.time()), 300)
+        if ttl > 0:
+            cache_set(cache_key, json.dumps(claims), ttl=ttl)
+    return claims

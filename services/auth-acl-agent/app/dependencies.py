@@ -1,242 +1,84 @@
 """
-FastAPI dependencies for request handling.
+FastAPI dependencies: bearer-token authentication and tenant-bound DB sessions.
 
-This module provides dependency injection functions for FastAPI endpoints,
-including authentication, user claims extraction, and database sessions.
+The tenant is always taken from the validated token, never from a request
+header, so a caller cannot evaluate access in another tenant.
 """
 
 import logging
 from typing import Optional
+from uuid import UUID
 
 from fastapi import Depends, Header, HTTPException, status
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from app.claims import normalize_claims
 from app.config import settings
-from app.database import get_db
-from app.oidc import extract_user_claims, validate_token_cached
+from app.database import get_db, set_tenant_context
+from app.models import Tenant
+from app.oidc import validate_token_cached
 from app.schemas import UserClaims
 
 logger = logging.getLogger(__name__)
 
+_UNAUTHORIZED = {"WWW-Authenticate": "Bearer"}
 
-# ============================================================================
-# Authentication Dependencies
-# ============================================================================
 
-async def get_token_from_header(
-    authorization: Optional[str] = Header(None, alias="Authorization")
-) -> str:
-    """
-    Extract JWT token from Authorization header.
-    
-    Args:
-        authorization: Authorization header value
-        
-    Returns:
-        JWT token string
-        
-    Raises:
-        HTTPException: If token is missing or invalid format
-    """
+def get_token_from_header(authorization: Optional[str] = Header(None, alias="Authorization")) -> str:
     if not authorization:
-        logger.warning("Missing Authorization header")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Authorization header is required",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
-    # Check for Bearer token format
-    parts = authorization.split()
-    if len(parts) != 2 or parts[0].lower() != "bearer":
-        logger.warning(f"Invalid Authorization header format: {authorization[:20]}...")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid Authorization header format. Expected: Bearer <token>",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
-    
-    return parts[1]
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Authorization header is required", _UNAUTHORIZED)
+    scheme, _, token = authorization.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Expected: Bearer <token>", _UNAUTHORIZED)
+    return token.strip()
 
 
-async def get_current_user(
-    token: str = Depends(get_token_from_header)
-) -> UserClaims:
-    """
-    Validate token and extract user claims.
-    
-    Args:
-        token: JWT token from Authorization header
-        
-    Returns:
-        UserClaims object
-        
-    Raises:
-        HTTPException: If token is invalid or expired
-    """
+def resolve_tenant(db: Session, tenant_ref: str) -> Optional[Tenant]:
+    """Keycloak sends the tenant slug; accept a UUID too."""
     try:
-        # Validate token and get claims
-        token_claims = await validate_token_cached(token)
-        
-        if not token_claims:
-            logger.warning("Token validation failed")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Invalid or expired token",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
-        
-        # Extract and normalize user claims
-        user_claims = extract_user_claims(token_claims)
-        
-        # Validate required claims
-        if not user_claims.get("user_id"):
-            logger.error("Token missing user_id claim")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token missing required claims",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
-        
-        if not user_claims.get("tenant_id"):
-            logger.error("Token missing tenant_id claim")
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token missing tenant_id claim",
-                headers={"WWW-Authenticate": "Bearer"}
-            )
-        
-        # Convert to UserClaims model
-        claims = UserClaims(**user_claims)
-        
-        logger.debug(f"Authenticated user: {claims.user_id} (tenant: {claims.tenant_id})")
-        return claims
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        logger.error(f"Error validating token: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token validation failed",
-            headers={"WWW-Authenticate": "Bearer"}
-        )
+        condition = Tenant.tenant_id == UUID(tenant_ref)
+    except ValueError:
+        condition = Tenant.tenant_slug == tenant_ref
+    return db.execute(select(Tenant).where(condition)).scalar_one_or_none()
 
 
-async def get_optional_user(
-    authorization: Optional[str] = Header(None, alias="Authorization")
-) -> Optional[UserClaims]:
-    """
-    Get user claims if token is provided, otherwise return None.
-    
-    Useful for endpoints that support both authenticated and unauthenticated access.
-    
-    Args:
-        authorization: Authorization header value
-        
-    Returns:
-        UserClaims if authenticated, None otherwise
-    """
-    if not authorization:
-        return None
-    
-    try:
-        token = await get_token_from_header(authorization)
-        return await get_current_user(token)
-    except HTTPException:
-        return None
+def claims_from_token(token_claims: dict, db: Session) -> UserClaims:
+    normalised = normalize_claims(token_claims, settings.oidc_client_id, settings.external_group_set)
+    if not normalised["user_id"]:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token missing sub claim", _UNAUTHORIZED)
+    tenant_ref = normalised.pop("tenant_ref")
+    if not tenant_ref:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token missing tenant_id claim", _UNAUTHORIZED)
+
+    tenant = resolve_tenant(db, tenant_ref)
+    if tenant is None or not tenant.is_active:
+        logger.warning("Token for unknown or inactive tenant %r", tenant_ref)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Tenant not found or inactive")
+
+    return UserClaims(tenant_id=str(tenant.tenant_id), tenant_slug=tenant.tenant_slug, **normalised)
 
 
-# ============================================================================
-# Tenant Context Dependencies
-# ============================================================================
-
-def get_tenant_id(
-    x_tenant_id: Optional[str] = Header(None, alias="X-Tenant-ID")
-) -> Optional[str]:
-    """
-    Extract tenant ID from request header.
-    
-    Args:
-        x_tenant_id: Tenant ID from X-Tenant-ID header
-        
-    Returns:
-        Tenant ID or None
-    """
-    if settings.require_tenant_id and not x_tenant_id:
-        logger.warning("Missing X-Tenant-ID header")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="X-Tenant-ID header is required"
-        )
-    
-    return x_tenant_id
+async def get_token_claims(token: str = Depends(get_token_from_header)) -> dict:
+    token_claims = await validate_token_cached(token)
+    if not token_claims:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired token", _UNAUTHORIZED)
+    return token_claims
 
 
-def verify_tenant_match(
-    user_claims: UserClaims = Depends(get_current_user),
-    tenant_id: Optional[str] = Depends(get_tenant_id)
+def get_current_user(
+    token_claims: dict = Depends(get_token_claims),
+    db: Session = Depends(get_db),
 ) -> UserClaims:
-    """
-    Verify that user's tenant matches the requested tenant.
-    
-    Args:
-        user_claims: User claims from token
-        tenant_id: Tenant ID from header
-        
-    Returns:
-        UserClaims if tenant matches
-        
-    Raises:
-        HTTPException: If tenant mismatch
-    """
-    if settings.strict_tenant_isolation and tenant_id:
-        if user_claims.tenant_id != tenant_id:
-            logger.warning(
-                f"Tenant mismatch: user={user_claims.tenant_id}, requested={tenant_id}"
-            )
-            raise HTTPException(
-                status_code=status.HTTP_403_FORBIDDEN,
-                detail="Tenant mismatch"
-            )
-    
-    return user_claims
+    # Sync dependency: FastAPI runs it in the threadpool, so the tenant lookup
+    # does not block the event loop.
+    return claims_from_token(token_claims, db)
 
 
-# ============================================================================
-# Database Dependencies
-# ============================================================================
-
-def get_db_session() -> Session:
-    """
-    Get database session.
-    
-    This is a simple wrapper around get_db for consistency.
-    
-    Returns:
-        Database session
-    """
-    return next(get_db())
-
-
-# ============================================================================
-# Combined Dependencies
-# ============================================================================
-
-def get_authenticated_user_with_db(
-    user_claims: UserClaims = Depends(get_current_user),
-    db: Session = Depends(get_db)
-) -> tuple[UserClaims, Session]:
-    """
-    Get authenticated user and database session together.
-    
-    Args:
-        user_claims: User claims from token
-        db: Database session
-        
-    Returns:
-        Tuple of (UserClaims, Session)
-    """
-    return user_claims, db
-
-# Made with Bob
+def get_tenant_db(
+    user: UserClaims = Depends(get_current_user),
+    db: Session = Depends(get_db),
+) -> Session:
+    """Database session bound to the caller's tenant for RLS."""
+    set_tenant_context(db, UUID(user.tenant_id))
+    return db

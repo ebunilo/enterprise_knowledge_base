@@ -2,6 +2,14 @@
 
 Authentication and access control service for the Enterprise RAG System.
 
+> **0.2.0 changes** (supersede the details below where they differ)
+> - `/api/v1/acl/filter` now evaluates every chunk against PostgreSQL (document status, current version, access policies, clearance, region) and **fails closed**. Previously it authorized any chunk not found in the cache. Response adds `reason_by_chunk`.
+> - Access decisions are no longer cached, so permission changes apply immediately; the `/cache/invalidate/*` endpoints were removed. Denials are written to `audit_logs` (`event_type = ACL_DECISION`).
+> - Keycloak: `OIDC_PROVIDER_URL` must be the realm URL. Tokens are accepted when `aud` contains `OIDC_AUDIENCES` (default: client ID) **or** `azp` is the client, so no Audience mapper is required. ID tokens are rejected, and JWKS is refreshed automatically on key rotation.
+> - Claims: the tenant slug (`global-company`) is resolved to the tenant UUID. Groups (`/finance` → `finance`), roles (`role`, `realm_access`, `resource_access.<client>`) and clearance (`confidential` → `CONFIDENTIAL`) are normalised, and matching is case-insensitive. Users in `EXTERNAL_GROUPS` or with PUBLIC clearance are not employees.
+> - CONFIDENTIAL/REGULATED/EXECUTIVE_ONLY require clearance ≥ classification **and** an explicit policy grant (`ENFORCE_CLEARANCE`).
+> - Removed placeholder `/auth/callback` and `/auth/logout`; the UI performs the OIDC code flow against Keycloak directly.
+
 ## Overview
 
 The Auth ACL Agent is a FastAPI microservice that provides JWT token validation, user claims extraction, and access control logic for the Enterprise RAG System. It enforces strict access control across all document categories and ensures users can only access documents they are authorized to view.

@@ -2,6 +2,16 @@
 
 Document and chunk metadata management service for the Enterprise RAG System.
 
+> **0.2.0 changes** (supersede the details below where they differ)
+> - All `/api/v1` routes require `X-API-Key` (one of `SERVICE_API_KEYS`, falls back to `SECRET_KEY`).
+> - `X-Tenant-ID` accepts the tenant UUID or slug (e.g. `global-company`).
+> - Status/classification/source type values are the uppercase DB enums (`ACTIVE`, `INTERNAL_GENERAL`, `SHAREPOINT`); lowercase input is still accepted.
+> - Versioning: POSTing a document with an existing `source_uri` creates version N+1 (non-current). `POST /documents/{id}/activate` makes it current and archives the previous one. `GET /documents/{id}/versions` lists history.
+> - Chunks inherit classification/department/region/language from their document; the checksum is computed server-side.
+> - `POST /chunks/batch` resolves retriever output in request order and returns only chunks of ACTIVE, current versions (`missing_chunk_ids` for the rest), with citation metadata. It is **not** an authorization check; use auth-acl `/api/v1/acl/filter`.
+> - New: `POST /retrieval-audit`, `GET /retrieval-audit/{id}`, `POST /feedback` (self-improvement signals, see `SELF_IMPROVEMENT.md`).
+> - Tests: `pip install -r requirements-dev.txt && pytest` with `TEST_DATABASE_URL` (rag_app) and `TEST_ADMIN_DATABASE_URL` set against a migrated database.
+
 ## Overview
 
 The Canonical DB Agent is a FastAPI microservice that provides CRUD operations for documents, chunks, and versions with multi-tenant support and Row-Level Security (RLS). It serves as the source of truth for all document metadata in the Enterprise RAG System.

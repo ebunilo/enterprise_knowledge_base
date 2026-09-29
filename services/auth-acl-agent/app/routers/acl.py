@@ -1,20 +1,19 @@
 """
-Access Control List (ACL) API endpoints.
+Access Control endpoints.
 
-This module provides endpoints for access authorization checks,
-chunk filtering, and retrieval filter building.
+`/filter` is the endpoint the RAG orchestrator must call with the end user's
+bearer token for every candidate set from Qdrant, BM25 and the knowledge
+graph, before context building (AGENTS.md 5.11, section 14).
 """
 
 import logging
-from datetime import datetime
-from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
 from app import acl
-from app.database import get_db
-from app.dependencies import get_current_user
+from app.config import settings
+from app.dependencies import get_current_user, get_tenant_db
 from app.schemas import (
     AccessCheckRequest,
     AccessDecision,
@@ -22,7 +21,6 @@ from app.schemas import (
     BatchAccessCheckResponse,
     FilterChunksRequest,
     FilterChunksResponse,
-    RetrievalFilterRequest,
     RetrievalFilterResponse,
     UserClaims,
     UserPermissionsResponse,
@@ -30,321 +28,89 @@ from app.schemas import (
 
 logger = logging.getLogger(__name__)
 
-# Create router
-router = APIRouter()
+router = APIRouter(tags=["Access Control"])
 
 
-# ============================================================================
-# Access Authorization Endpoints
-# ============================================================================
-
-@router.post(
-    "/authorize",
-    response_model=AccessDecision,
-    summary="Check document/chunk access",
-    description="Check if user can access a specific document or chunk",
-    tags=["Access Control"]
-)
-async def authorize_access(
-    request: AccessCheckRequest,
-    user_claims: UserClaims = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Check if user can access a document or chunk.
-    
-    Args:
-        request: Access check request with document_id or chunk_id
-        user_claims: User claims from token
-        db: Database session
-        
-    Returns:
-        AccessDecision with granted/denied and reason
-        
-    Raises:
-        400: If neither document_id nor chunk_id is provided
-    """
-    if not request.document_id and not request.chunk_id:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Either document_id or chunk_id must be provided"
-        )
-    
-    item_id = request.document_id or request.chunk_id
-    item_type = "document" if request.document_id else "chunk"
-    
-    logger.debug(f"Checking access for user {user_claims.user_id} to {item_type} {item_id}")
-    
-    # TODO: In production, fetch document/chunk metadata from canonical-db-agent
-    # For MVP, we'll use placeholder values
-    granted, reason = acl.can_access(
-        user_claims=user_claims,
-        document_id=item_id,
-        tenant_id=user_claims.tenant_id,
-        classification="INTERNAL_GENERAL",
-        status="active",
-        policy=None
-    )
-    
-    # Cache the decision
-    acl.cache_access_decision(
-        user_id=user_claims.user_id,
-        item_id=item_id,
-        granted=granted,
-        reason=reason
-    )
-    
-    logger.info(f"Access {'' if granted else 'denied'} for user {user_claims.user_id}: {reason}")
-    
-    return AccessDecision(
-        granted=granted,
-        reason=reason,
-        checked_at=datetime.utcnow(),
-        user_id=user_claims.user_id,
-        item_id=item_id,
-        item_type=item_type
-    )
-
-
-@router.post(
-    "/authorize/batch",
-    response_model=BatchAccessCheckResponse,
-    summary="Batch access check",
-    description="Check access to multiple documents or chunks",
-    tags=["Access Control"]
-)
-async def authorize_batch(
-    request: BatchAccessCheckRequest,
-    user_claims: UserClaims = Depends(get_current_user),
-    db: Session = Depends(get_db)
-):
-    """
-    Check access to multiple documents or chunks.
-    
-    Args:
-        request: Batch access check request
-        user_claims: User claims from token
-        db: Database session
-        
-    Returns:
-        BatchAccessCheckResponse with results map
-        
-    Raises:
-        400: If neither document_ids nor chunk_ids is provided
-    """
-    if not request.document_ids and not request.chunk_ids:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Either document_ids or chunk_ids must be provided"
-        )
-    
-    ids_to_check = request.document_ids or request.chunk_ids
-    
-    logger.debug(f"Batch checking access for {len(ids_to_check)} items")
-    
-    # Perform batch access check
-    results = acl.batch_check_access(
-        user_claims=user_claims,
-        document_ids=ids_to_check,
-        db=db
-    )
-    
-    granted_count = sum(1 for granted in results.values() if granted)
-    denied_count = len(results) - granted_count
-    
-    logger.info(f"Batch check complete: {granted_count} granted, {denied_count} denied")
-    
-    return BatchAccessCheckResponse(
-        results=results,
-        granted_count=granted_count,
-        denied_count=denied_count
-    )
-
-
-# ============================================================================
-# Chunk Filtering Endpoints
-# ============================================================================
-
-@router.post(
-    "/filter",
-    response_model=FilterChunksResponse,
-    summary="Filter chunk IDs by access",
-    description="Filter a list of chunk IDs to only those the user can access",
-    tags=["Access Control"]
-)
-async def filter_chunks(
+@router.post("/filter", response_model=FilterChunksResponse,
+             summary="Partition candidate chunk IDs into authorized and denied")
+def filter_chunks(
     request: FilterChunksRequest,
-    user_claims: UserClaims = Depends(get_current_user),
-    db: Session = Depends(get_db)
+    user: UserClaims = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
 ):
-    """
-    Filter chunk IDs to only those the user can access.
-    
-    This is a critical security boundary before context building.
-    
-    Args:
-        request: Filter request with chunk IDs
-        user_claims: User claims from token
-        db: Database session
-        
-    Returns:
-        FilterChunksResponse with authorized and denied chunk IDs
-    """
-    logger.debug(f"Filtering {len(request.chunk_ids)} chunks for user {user_claims.user_id}")
-    
-    # Filter chunks by access
-    authorized, denied = acl.filter_authorized_chunks(
-        user_claims=user_claims,
-        chunk_ids=request.chunk_ids,
-        db=db
-    )
-    
-    logger.info(
-        f"Filtered chunks: {len(authorized)} authorized, {len(denied)} denied "
-        f"out of {len(request.chunk_ids)} total"
-    )
-    
+    result = acl.filter_authorized_chunks(db, user, request.chunk_ids, settings.enforce_clearance)
+    if settings.log_access_denials and result.denied:
+        try:
+            acl.record_decision(db, user, "filter_chunks", result)
+        except Exception as e:
+            db.rollback()
+            logger.error("Failed to record ACL decision: %s", e)
     return FilterChunksResponse(
-        authorized_chunk_ids=authorized,
-        denied_chunk_ids=denied,
+        authorized_chunk_ids=result.authorized,
+        denied_chunk_ids=result.denied,
+        reason_by_chunk=result.reasons,
         total_requested=len(request.chunk_ids),
-        total_authorized=len(authorized)
+        total_authorized=len(result.authorized),
     )
 
 
-# ============================================================================
-# Retrieval Filter Endpoints
-# ============================================================================
-
-@router.post(
-    "/retrieval-filter",
-    response_model=RetrievalFilterResponse,
-    summary="Build retrieval filter",
-    description="Build metadata filter for pre-filtering retrieval results",
-    tags=["Access Control"]
-)
-async def build_retrieval_filter_endpoint(
-    request: RetrievalFilterRequest,
-    user_claims: UserClaims = Depends(get_current_user)
+@router.post("/authorize", response_model=AccessDecision, summary="Check access to one document or chunk")
+def authorize_access(
+    request: AccessCheckRequest,
+    user: UserClaims = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
 ):
-    """
-    Build metadata filter for pre-filtering retrieval results.
-    
-    Used by Qdrant, BM25, and Knowledge Graph retrievers.
-    
-    Args:
-        request: Retrieval filter request
-        user_claims: User claims from token
-        
-    Returns:
-        RetrievalFilterResponse with metadata filter
-    """
-    logger.debug(f"Building retrieval filter for user {user_claims.user_id}")
-    
-    # Build filter
-    filter_dict = acl.build_retrieval_filter(user_claims)
-    
-    logger.info(f"Built retrieval filter for user {user_claims.user_id}")
-    
+    if request.chunk_id is not None:
+        result = acl.filter_authorized_chunks(db, user, [request.chunk_id], settings.enforce_clearance)
+        granted = bool(result.authorized)
+        reason = "access_granted" if granted else result.reasons[str(request.chunk_id)]
+        item_id, item_type = request.chunk_id, "chunk"
+    else:
+        granted, reason = acl.check_documents(db, user, [request.document_id], settings.enforce_clearance)[
+            request.document_id
+        ]
+        item_id, item_type = request.document_id, "document"
+    return AccessDecision(granted=granted, reason=reason, user_id=user.user_id, item_id=item_id, item_type=item_type)
+
+
+@router.post("/authorize/batch", response_model=BatchAccessCheckResponse,
+             summary="Check access to many documents and/or chunks")
+def authorize_batch(
+    request: BatchAccessCheckRequest,
+    user: UserClaims = Depends(get_current_user),
+    db: Session = Depends(get_tenant_db),
+):
+    results, reasons = {}, {}
+    for doc_id, (granted, reason) in acl.check_documents(
+        db, user, request.document_ids, settings.enforce_clearance
+    ).items():
+        results[str(doc_id)] = granted
+        reasons[str(doc_id)] = reason
+    chunk_result = acl.filter_authorized_chunks(db, user, request.chunk_ids, settings.enforce_clearance)
+    for chunk_id in chunk_result.authorized:
+        results[str(chunk_id)] = True
+        reasons[str(chunk_id)] = "access_granted"
+    for chunk_id in chunk_result.denied:
+        results[str(chunk_id)] = False
+        reasons[str(chunk_id)] = chunk_result.reasons[str(chunk_id)]
+
+    granted_count = sum(results.values())
+    return BatchAccessCheckResponse(
+        results=results, reason_by_item=reasons,
+        granted_count=granted_count, denied_count=len(results) - granted_count,
+    )
+
+
+@router.post("/retrieval-filter", response_model=RetrievalFilterResponse,
+             summary="Metadata pre-filter for retrievers (not an authorization decision)")
+def build_retrieval_filter(user: UserClaims = Depends(get_current_user)):
     return RetrievalFilterResponse(
-        filter=filter_dict,
-        user_id=user_claims.user_id,
-        tenant_id=user_claims.tenant_id
+        filter=acl.build_retrieval_filter(user, settings.enforce_clearance),
+        user_id=user.user_id,
+        tenant_id=user.tenant_id,
     )
 
 
-# ============================================================================
-# User Permissions Endpoints
-# ============================================================================
-
-@router.get(
-    "/user/permissions",
-    response_model=UserPermissionsResponse,
-    summary="Get user permissions",
-    description="Get summary of user's permissions and accessible classifications",
-    tags=["Access Control"]
-)
-async def get_user_permissions(
-    user_claims: UserClaims = Depends(get_current_user)
-):
-    """
-    Get summary of user's permissions.
-    
-    Args:
-        user_claims: User claims from token
-        
-    Returns:
-        UserPermissionsResponse with permissions summary
-    """
-    logger.debug(f"Getting permissions for user {user_claims.user_id}")
-    
-    # Get permissions summary
-    permissions = acl.get_user_permissions_summary(user_claims)
-    
-    return UserPermissionsResponse(**permissions)
-
-
-# ============================================================================
-# Cache Management Endpoints
-# ============================================================================
-
-@router.post(
-    "/cache/invalidate/user",
-    summary="Invalidate user cache",
-    description="Invalidate all cached access decisions for the current user",
-    tags=["Cache Management"]
-)
-async def invalidate_user_cache(
-    user_claims: UserClaims = Depends(get_current_user)
-):
-    """
-    Invalidate all cached access decisions for the current user.
-    
-    Args:
-        user_claims: User claims from token
-        
-    Returns:
-        Cache invalidation result
-    """
-    logger.info(f"Invalidating cache for user {user_claims.user_id}")
-    
-    count = acl.invalidate_user_cache(user_claims.user_id)
-    
-    return {
-        "message": "User cache invalidated",
-        "user_id": user_claims.user_id,
-        "entries_deleted": count
-    }
-
-
-@router.post(
-    "/cache/invalidate/document/{document_id}",
-    summary="Invalidate document cache",
-    description="Invalidate all cached access decisions for a document",
-    tags=["Cache Management"]
-)
-async def invalidate_document_cache(
-    document_id: UUID,
-    user_claims: UserClaims = Depends(get_current_user)
-):
-    """
-    Invalidate all cached access decisions for a document.
-    
-    Args:
-        document_id: Document UUID
-        user_claims: User claims from token
-        
-    Returns:
-        Cache invalidation result
-    """
-    logger.info(f"Invalidating cache for document {document_id}")
-    
-    count = acl.invalidate_document_cache(document_id)
-    
-    return {
-        "message": "Document cache invalidated",
-        "document_id": str(document_id),
-        "entries_deleted": count
-    }
-
-# Made with Bob
+@router.get("/user/permissions", response_model=UserPermissionsResponse, summary="Caller's permission summary")
+def get_user_permissions(user: UserClaims = Depends(get_current_user)):
+    return UserPermissionsResponse(**acl.get_user_permissions_summary(user, settings.enforce_clearance))
