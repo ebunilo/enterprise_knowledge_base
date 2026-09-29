@@ -7,8 +7,14 @@ on:
       - develop
     paths:
       - "infra/docker-compose/**"
-      - "services/canonical-db-agent/**"
-      - "services/auth-acl-agent/**"
+      - "services/**"
+      - "packages/**"
+      - ".github/workflows/deploy-phase1.yml"
+  pull_request:
+    paths:
+      - "infra/docker-compose/**"
+      - "services/**"
+      - "packages/**"
       - ".github/workflows/deploy-phase1.yml"
 
   workflow_dispatch:
@@ -28,218 +34,154 @@ env:
 
 jobs:
   # ============================================================================
-  # BUILD AND TEST
+  # UNIT + INTEGRATION TESTS (real PostgreSQL, migrations applied)
+  # ============================================================================
+  test:
+    name: Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB: enterprise_rag
+          POSTGRES_USER: rag_admin
+          POSTGRES_PASSWORD: ci-admin-password
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U rag_admin -d enterprise_rag"
+          --health-interval 5s --health-timeout 5s --health-retries 10
+
+    env:
+      PGHOST: localhost
+      PGPORT: 5432
+      PGPASSWORD: ci-admin-password
+      POSTGRES_USER: rag_admin
+      POSTGRES_DB: enterprise_rag
+      APP_DB_PASSWORD: ci-app-password
+      TEST_DATABASE_URL: postgresql://rag_app:ci-app-password@localhost:5432/enterprise_rag
+      TEST_ADMIN_DATABASE_URL: postgresql://rag_admin:ci-admin-password@localhost:5432/enterprise_rag
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Apply baseline schema and migrations
+        run: |
+          psql -X -q -v ON_ERROR_STOP=1 -U rag_admin -d enterprise_rag \
+            -f infra/docker-compose/postgres/init/01-init-database.sql
+          bash infra/docker-compose/postgres/migrations/migrate.sh
+          echo "Re-running migrations must be a no-op:"
+          bash infra/docker-compose/postgres/migrations/migrate.sh
+
+      - name: adaptive-tuning package
+        working-directory: packages/adaptive-tuning
+        run: |
+          pip install -q pytest==7.4.4
+          PYTHONPATH=. python -m pytest -q
+
+      - name: canonical-db-agent
+        working-directory: services/canonical-db-agent
+        run: |
+          python -m venv .venv && . .venv/bin/activate
+          pip install -q -r requirements-dev.txt
+          python -m pytest -q
+
+      - name: auth-acl-agent
+        working-directory: services/auth-acl-agent
+        run: |
+          python -m venv .venv && . .venv/bin/activate
+          pip install -q -r requirements-dev.txt
+          python -m pytest -q
+
+  # ============================================================================
+  # COMPOSE SMOKE TEST (images build, stack boots, RLS enforced)
   # ============================================================================
   build-and-test:
-    name: Build and Test
+    name: Build and Smoke Test
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Cache Docker layers
-        uses: actions/cache@v3
-        with:
-          path: /tmp/.buildx-cache
-          key: ${{ runner.os }}-buildx-${{ github.sha }}
-          restore-keys: |
-            ${{ runner.os }}-buildx-
-
       - name: Create .env file for testing
         run: |
           cd infra/docker-compose
           cp .env.example .env
-
-          # Generate secure passwords for testing (alphanumeric only to avoid sed issues)
-          export POSTGRES_PASSWORD=$(openssl rand -hex 16)
-          export MINIO_ROOT_PASSWORD=$(openssl rand -hex 16)
-          export REDIS_PASSWORD=$(openssl rand -hex 16)
-          export SECRET_KEY=$(openssl rand -hex 32)
-
-          # Update .env with generated passwords using | as delimiter to avoid issues with special chars
-          sed -i "s|POSTGRES_PASSWORD=.*|POSTGRES_PASSWORD=${POSTGRES_PASSWORD}|" .env
-          sed -i "s|MINIO_ROOT_PASSWORD=.*|MINIO_ROOT_PASSWORD=${MINIO_ROOT_PASSWORD}|" .env
-          sed -i "s|REDIS_PASSWORD=.*|REDIS_PASSWORD=${REDIS_PASSWORD}|" .env
-          sed -i "s|SECRET_KEY=.*|SECRET_KEY=${SECRET_KEY}|" .env
-
-          # Set test OIDC values
-          sed -i "s|OIDC_PROVIDER_URL=.*|OIDC_PROVIDER_URL=https://test.example.com|" .env
-          sed -i "s|OIDC_CLIENT_ID=.*|OIDC_CLIENT_ID=test-client-id|" .env
-          sed -i "s|OIDC_CLIENT_SECRET=.*|OIDC_CLIENT_SECRET=test-client-secret|" .env
+          set_env() { sed -i "s|^$1=.*|$1=$2|" .env; }
+          set_env POSTGRES_PASSWORD "$(openssl rand -hex 16)"
+          set_env APP_DB_PASSWORD "$(openssl rand -hex 16)"
+          set_env MINIO_ROOT_PASSWORD "$(openssl rand -hex 16)"
+          set_env REDIS_PASSWORD "$(openssl rand -hex 16)"
+          set_env SECRET_KEY "$(openssl rand -hex 32)"
+          set_env POSTGRES_PORT 5433
+          set_env REDIS_PORT 6380
+          set_env OIDC_PROVIDER_URL https://test.example.com/realms/test
+          set_env OIDC_CLIENT_ID test-client-id
+          set_env OIDC_CLIENT_SECRET test-client-secret
 
       - name: Validate docker-compose configuration
+        working-directory: infra/docker-compose
+        run: docker compose config --quiet
+
+      - name: Build and start the stack
+        working-directory: infra/docker-compose
         run: |
-          cd infra/docker-compose
-          docker compose config --quiet
-
-      - name: Start infrastructure services
-        run: |
-          cd infra/docker-compose
-
-          echo "Starting services..."
-          docker compose up -d postgres redis minio
-
-          echo ""
-          echo "Checking if init script is mounted..."
-          docker compose exec -T postgres ls -la /docker-entrypoint-initdb.d/ || echo "Init directory not accessible yet"
-
-          # Wait for PostgreSQL to accept connections
-          echo ""
-          echo "Waiting for PostgreSQL to accept connections..."
-          timeout 60 bash -c 'until docker compose exec -T postgres pg_isready -U rag_admin; do sleep 2; done'
-
-          echo "✅ PostgreSQL is accepting connections"
-
-          # Give init scripts time to run
-          echo ""
-          echo "Waiting for initialization scripts to execute..."
-          sleep 10
-
-          # Check PostgreSQL logs for init script execution
-          echo ""
-          echo "Checking PostgreSQL logs for initialization..."
-          docker compose logs postgres | tail -100
-
-          # Check for errors in logs
-          echo ""
-          echo "Checking for errors in PostgreSQL logs..."
-          docker compose logs postgres 2>&1 | grep -i "error" || echo "No errors found in logs"
-
-          # Wait for initialization scripts to complete (check if tables exist)
-          echo ""
-          echo "Waiting for database tables to be created..."
-          timeout 120 bash -c 'until docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" 2>/dev/null | grep -q "tenants"; do
-            echo "Waiting for tables... (checking every 5 seconds)";
-            docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" 2>/dev/null | head -10 || echo "Database not ready yet";
-            sleep 5;
+          docker compose up -d --build
+          timeout 180 bash -c 'until [ "$(docker compose ps --format "{{.Service}} {{.Health}}" \
+              | grep -E "^(postgres|redis|canonical-db-api|auth-acl-api) " | grep -vc " healthy$")" = "0" ]; do
+            docker compose ps; sleep 5;
           done'
-
-          echo "✅ PostgreSQL initialized successfully"
-
-          # Wait for all services to be healthy using docker compose ps
-          echo ""
-          echo "Waiting for all services to be healthy..."
-          timeout 120 bash -c 'until docker compose ps | grep -E "(redis|minio)" | grep -v "Up" | wc -l | grep -q "^0$"; do
-            echo "Waiting for services...";
-            docker compose ps | grep -E "(redis|minio)";
-            sleep 5;
-          done'
-
-          echo ""
-          echo "✅ All services ready"
           docker compose ps
 
-      - name: Check init script execution
+      - name: Verify schema, migrations and RLS
+        working-directory: infra/docker-compose
         run: |
-          cd infra/docker-compose
+          PSQL="docker compose exec -T postgres psql -X -tA -U rag_admin -d enterprise_rag"
+          $PSQL -c "SELECT string_agg(version, ',' ORDER BY version) FROM schema_migrations" | tee /dev/stderr \
+            | grep -q "0002_security_and_canonical_model,0003_self_improvement"
+          for t in tenants users documents document_chunks access_policies retrieval_audit_logs user_feedback \
+                   tuning_parameters tuning_experiments evaluation_cases; do
+            $PSQL -c "SELECT to_regclass('public.$t') IS NOT NULL" | grep -q t || { echo "missing $t"; exit 1; }
+          done
+          # rag_app with no tenant context must see nothing (fail-closed RLS).
+          APP_DB_PASSWORD=$(grep '^APP_DB_PASSWORD=' .env | cut -d= -f2-)
+          visible=$(docker compose exec -T -e PGPASSWORD="$APP_DB_PASSWORD" postgres \
+            psql -X -tA -h localhost -U rag_app -d enterprise_rag -c "SELECT count(*) FROM users")
+          [ "$visible" = "0" ] || { echo "RLS not enforced: rag_app saw $visible users"; exit 1; }
+          echo "✅ schema, migrations and RLS verified"
 
-          echo "Manually running init script to capture errors..."
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -f /docker-entrypoint-initdb.d/01-init-database.sql 2>&1 || echo "Init script failed"
-
-          echo ""
-          echo "Checking what tables exist after manual run..."
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt"
-
-      - name: Verify database initialization
+      - name: Service health
+        working-directory: infra/docker-compose
         run: |
-          cd infra/docker-compose
+          curl -fsS http://127.0.0.1:8001/health
+          curl -fsS http://127.0.0.1:8002/health
+          # canonical-db API must reject unauthenticated calls
+          code=$(curl -s -o /dev/null -w "%{http_code}" -H "X-Tenant-ID: default" http://127.0.0.1:8001/api/v1/documents)
+          [ "$code" = "401" ] || { echo "expected 401, got $code"; exit 1; }
 
-          echo "Checking database tables..."
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt"
-
-          echo ""
-          echo "Verifying required tables exist..."
-
-          # Check if tables were created
-          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "tenants"; then
-            echo "❌ Table 'tenants' not found"
-            exit 1
-          fi
-          echo "✅ Table 'tenants' found"
-
-          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "users"; then
-            echo "❌ Table 'users' not found"
-            exit 1
-          fi
-          echo "✅ Table 'users' found"
-
-          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "documents"; then
-            echo "❌ Table 'documents' not found"
-            exit 1
-          fi
-          echo "✅ Table 'documents' found"
-
-          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "document_chunks"; then
-            echo "❌ Table 'document_chunks' not found"
-            exit 1
-          fi
-          echo "✅ Table 'document_chunks' found"
-
-          if ! docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "\dt" | grep -q "access_policies"; then
-            echo "❌ Table 'access_policies' not found"
-            exit 1
-          fi
-          echo "✅ Table 'access_policies' found"
-
-          echo ""
-          echo "✅ All required database tables created successfully"
-
-      - name: Verify RLS policies
-        run: |
-          cd infra/docker-compose
-
-          # Check if RLS is enabled
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "
-            SELECT tablename, rowsecurity
-            FROM pg_tables
-            WHERE schemaname = 'public'
-            AND tablename IN ('tenants', 'users', 'documents', 'document_chunks', 'access_policies')
-          " | grep -q "t"
-
-          echo "✅ Row-Level Security enabled"
-
-      - name: Verify default data
-        run: |
-          cd infra/docker-compose
-
-          # Check default tenant
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "
-            SELECT tenant_name FROM tenants WHERE tenant_slug = 'default'
-          " | grep -q "Default Tenant"
-
-          # Check system admin
-          docker compose exec -T postgres psql -U rag_admin -d enterprise_rag -c "
-            SELECT email FROM users WHERE role = 'SUPER_ADMIN'
-          " | grep -q "admin@enterprise-rag.local"
-
-          echo "✅ Default data created successfully"
+      - name: Logs on failure
+        if: failure()
+        working-directory: infra/docker-compose
+        run: docker compose logs --tail=200
 
       - name: Stop services
         if: always()
-        run: |
-          cd infra/docker-compose
-          docker compose down -v
-
-      - name: Upload test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: test-results
-          path: |
-            infra/docker-compose/logs/
-            infra/docker-compose/.env
+        working-directory: infra/docker-compose
+        run: docker compose down -v
 
   # ============================================================================
   # DEPLOY TO STAGING
   # ============================================================================
   deploy-staging:
     name: Deploy to Staging
-    needs: build-and-test
-    if: github.ref == 'refs/heads/develop' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    needs: [test, build-and-test]
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/develop' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging'))
     runs-on: ubuntu-latest
     environment: staging
 
@@ -254,31 +196,23 @@ jobs:
           chmod 600 ~/.ssh/id_rsa
           ssh-keyscan -H ${{ secrets.STAGING_SERVER_HOST }} >> ~/.ssh/known_hosts
 
-      - name: Deploy to staging server
+      - name: Copy files to staging server
         env:
           SERVER_HOST: ${{ secrets.STAGING_SERVER_HOST }}
           SERVER_USER: ${{ secrets.STAGING_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
         run: |
-          # Create deployment directory structure
           ssh ${SERVER_USER}@${SERVER_HOST} "mkdir -p ${DEPLOY_PATH}"
-
-          # Copy docker-compose files to server
+          # --delete must not remove server-side state (backups, .env) and
+          # local secret files must never be shipped.
           rsync -avz --delete \
-            --exclude='.git' \
-            --exclude='node_modules' \
-            --exclude='__pycache__' \
-            --exclude='.env' \
+            --exclude='.git' --exclude='__pycache__' \
+            --exclude='.env' --exclude='.env.*' --exclude='backups/' --exclude='secrets/' \
+            --exclude='services/' \
             infra/docker-compose/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/
-
-          # Copy services directory to server (required for Docker builds)
           rsync -avz --delete \
-            --exclude='.git' \
-            --exclude='node_modules' \
-            --exclude='__pycache__' \
-            --exclude='*.pyc' \
-            --exclude='.pytest_cache' \
-            --exclude='.venv' \
+            --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' \
+            --exclude='.pytest_cache' --exclude='.venv' --exclude='tests/' \
             services/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/services/
 
       - name: Create .env file on server
@@ -287,15 +221,20 @@ jobs:
           SERVER_USER: ${{ secrets.STAGING_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
         run: |
-          ssh ${SERVER_USER}@${SERVER_HOST} "cat > ${DEPLOY_PATH}/.env << 'EOF'
+          ssh ${SERVER_USER}@${SERVER_HOST} "umask 077 && cat > ${DEPLOY_PATH}/.env << 'EOF'
           ENVIRONMENT=staging
+          SERVICES_DIR=./services
+          BIND_ADDRESS=127.0.0.1
           POSTGRES_DB=${{ secrets.STAGING_POSTGRES_DB || 'enterprise_rag' }}
           POSTGRES_USER=${{ secrets.STAGING_POSTGRES_USER || 'rag_admin' }}
           POSTGRES_PASSWORD=${{ secrets.STAGING_POSTGRES_PASSWORD }}
           POSTGRES_PORT=${{ secrets.STAGING_POSTGRES_PORT || '5433' }}
+          APP_DB_USER=${{ secrets.STAGING_APP_DB_PASSWORD != '' && 'rag_app' || 'rag_admin' }}
+          APP_DB_PASSWORD=${{ secrets.STAGING_APP_DB_PASSWORD }}
           DB_POOL_SIZE=20
           DB_MAX_OVERFLOW=10
           DB_POOL_TIMEOUT=30
+          MINIO_IMAGE=${{ secrets.STAGING_MINIO_IMAGE || 'minio/minio:latest' }}
           MINIO_ROOT_USER=${{ secrets.STAGING_MINIO_ROOT_USER || 'minioadmin' }}
           MINIO_ROOT_PASSWORD=${{ secrets.STAGING_MINIO_ROOT_PASSWORD }}
           MINIO_API_PORT=${{ secrets.STAGING_MINIO_API_PORT || '9000' }}
@@ -305,84 +244,46 @@ jobs:
           REDIS_PORT=${{ secrets.STAGING_REDIS_PORT || '6380' }}
           CACHE_TTL=300
           SECRET_KEY=${{ secrets.STAGING_SECRET_KEY }}
-          JWT_ALGORITHM=RS256
-          JWT_EXPIRATION=3600
+          SERVICE_API_KEYS=${{ secrets.STAGING_SERVICE_API_KEYS }}
           OIDC_PROVIDER_URL=${{ secrets.STAGING_OIDC_PROVIDER_URL }}
           OIDC_CLIENT_ID=${{ secrets.STAGING_OIDC_CLIENT_ID }}
           OIDC_CLIENT_SECRET=${{ secrets.STAGING_OIDC_CLIENT_SECRET }}
-          OIDC_SCOPES=openid profile email
+          OIDC_AUDIENCES=${{ secrets.STAGING_OIDC_AUDIENCES }}
           ALLOWED_ORIGINS=${{ secrets.STAGING_ALLOWED_ORIGINS }}
           LOG_LEVEL=INFO
-          LOG_FORMAT=json
-          METRICS_ENABLED=true
           CANONICAL_DB_API_PORT=${{ secrets.STAGING_CANONICAL_DB_API_PORT || '8001' }}
           AUTH_ACL_API_PORT=${{ secrets.STAGING_AUTH_ACL_API_PORT || '8002' }}
           API_WORKERS=4
-          API_RELOAD=false
-          DOMAIN=${{ secrets.STAGING_DOMAIN }}
-          SSL_ENABLED=true
-          LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
-          NGINX_CLIENT_MAX_BODY_SIZE=100M
-          BACKUP_ENABLED=false
-          DEBUG=false
-          FEATURE_DOCUMENT_INGESTION=true
-          FEATURE_VECTOR_SEARCH=false
-          FEATURE_BM25_SEARCH=false
-          FEATURE_KNOWLEDGE_GRAPH=false
-          FEATURE_ANSWER_GENERATION=false
-          RATE_LIMIT_ENABLED=true
-          RATE_LIMIT_PER_MINUTE=60
-          RATE_LIMIT_BURST=10
           EOF"
 
-      - name: Deploy with docker-compose
+      - name: Migrate and deploy
         env:
           SERVER_HOST: ${{ secrets.STAGING_SERVER_HOST }}
           SERVER_USER: ${{ secrets.STAGING_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
         run: |
           ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
-            docker compose pull && \
-            docker compose up -d --remove-orphans && \
+            docker compose up -d postgres redis minio && \
+            timeout 120 bash -c 'until docker compose exec -T postgres pg_isready -U rag_admin; do sleep 3; done' && \
+            docker compose exec -T postgres bash /migrations/migrate.sh && \
+            docker compose up -d --build --remove-orphans && \
             docker compose ps"
-
-      - name: Wait for services to be healthy
-        env:
-          SERVER_HOST: ${{ secrets.STAGING_SERVER_HOST }}
-          SERVER_USER: ${{ secrets.STAGING_SERVER_USER }}
-          DEPLOY_PATH: ${{ secrets.STAGING_DEPLOY_PATH }}
-        run: |
-          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
-            timeout 120 bash -c 'until docker compose exec -T postgres pg_isready -U rag_admin; do sleep 5; done' && \
-            timeout 60 bash -c 'until docker compose exec -T redis redis-cli ping; do sleep 5; done' && \
-            timeout 60 bash -c 'until curl -f http://localhost:9000/minio/health/live; do sleep 5; done'"
 
       - name: Run health checks
         env:
           STAGING_URL: ${{ secrets.STAGING_URL }}
         run: |
-          # Wait a bit for services to fully start
-          sleep 10
-
-          # Check canonical-db-api health
+          sleep 15
           curl -f ${STAGING_URL}/api/canonical-db/health || echo "⚠️ Canonical DB API not responding"
-
-          # Check auth-acl-api health
           curl -f ${STAGING_URL}/api/auth-acl/health || echo "⚠️ Auth ACL API not responding"
-
-      - name: Notify deployment success
-        if: success()
-        run: |
-          echo "✅ Staging deployment successful"
-          echo "🔗 Staging URL: ${{ secrets.STAGING_URL }}"
 
   # ============================================================================
   # DEPLOY TO PRODUCTION
   # ============================================================================
   deploy-production:
     name: Deploy to Production
-    needs: build-and-test
-    if: github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    needs: [test, build-and-test]
+    if: github.event_name != 'pull_request' && (github.ref == 'refs/heads/main' || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production'))
     runs-on: ubuntu-latest
     environment: production
 
@@ -403,45 +304,33 @@ jobs:
           SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
         run: |
-          # Check if deployment exists and services are running
           if ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} 2>/dev/null && docker compose ps postgres 2>/dev/null | grep -q 'Up'"; then
-            echo "Existing deployment found, creating backup..."
             BACKUP_DIR="${DEPLOY_PATH}/backups/$(date +%Y%m%d_%H%M%S)"
             ssh ${SERVER_USER}@${SERVER_HOST} "
-              mkdir -p ${BACKUP_DIR} && \
+              mkdir -p ${BACKUP_DIR} && chmod 700 ${DEPLOY_PATH}/backups && \
               cd ${DEPLOY_PATH} && \
-              docker compose exec -T postgres pg_dump -U rag_admin enterprise_rag > ${BACKUP_DIR}/database.sql && \
-              echo '✅ Database backup created: ${BACKUP_DIR}/database.sql'
+              docker compose exec -T postgres pg_dump -U rag_admin -Fc enterprise_rag > ${BACKUP_DIR}/database.dump && \
+              echo '✅ Database backup created: ${BACKUP_DIR}/database.dump'
             "
           else
-            echo "⚠️ No existing deployment found, skipping backup (this is a fresh deployment)"
+            echo "⚠️ No existing deployment found, skipping backup (fresh deployment)"
           fi
 
-      - name: Deploy to production server
+      - name: Copy files to production server
         env:
           SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
           SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
         run: |
-          # Create deployment directory structure
           ssh ${SERVER_USER}@${SERVER_HOST} "mkdir -p ${DEPLOY_PATH}"
-
-          # Copy docker-compose files to server
           rsync -avz --delete \
-            --exclude='.git' \
-            --exclude='node_modules' \
-            --exclude='__pycache__' \
-            --exclude='.env' \
+            --exclude='.git' --exclude='__pycache__' \
+            --exclude='.env' --exclude='.env.*' --exclude='backups/' --exclude='secrets/' \
+            --exclude='services/' \
             infra/docker-compose/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/
-
-          # Copy services directory to server (required for Docker builds)
           rsync -avz --delete \
-            --exclude='.git' \
-            --exclude='node_modules' \
-            --exclude='__pycache__' \
-            --exclude='*.pyc' \
-            --exclude='.pytest_cache' \
-            --exclude='.venv' \
+            --exclude='.git' --exclude='__pycache__' --exclude='*.pyc' \
+            --exclude='.pytest_cache' --exclude='.venv' --exclude='tests/' \
             services/ ${SERVER_USER}@${SERVER_HOST}:${DEPLOY_PATH}/services/
 
       - name: Create .env file on server
@@ -450,15 +339,20 @@ jobs:
           SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
         run: |
-          ssh ${SERVER_USER}@${SERVER_HOST} "cat > ${DEPLOY_PATH}/.env << 'EOF'
+          ssh ${SERVER_USER}@${SERVER_HOST} "umask 077 && cat > ${DEPLOY_PATH}/.env << 'EOF'
           ENVIRONMENT=production
+          SERVICES_DIR=./services
+          BIND_ADDRESS=127.0.0.1
           POSTGRES_DB=${{ secrets.PRODUCTION_POSTGRES_DB || 'enterprise_rag' }}
           POSTGRES_USER=${{ secrets.PRODUCTION_POSTGRES_USER || 'rag_admin' }}
           POSTGRES_PASSWORD=${{ secrets.PRODUCTION_POSTGRES_PASSWORD }}
           POSTGRES_PORT=${{ secrets.PRODUCTION_POSTGRES_PORT || '5433' }}
+          APP_DB_USER=${{ secrets.PRODUCTION_APP_DB_PASSWORD != '' && 'rag_app' || 'rag_admin' }}
+          APP_DB_PASSWORD=${{ secrets.PRODUCTION_APP_DB_PASSWORD }}
           DB_POOL_SIZE=20
           DB_MAX_OVERFLOW=10
           DB_POOL_TIMEOUT=30
+          MINIO_IMAGE=${{ secrets.PRODUCTION_MINIO_IMAGE || 'minio/minio:latest' }}
           MINIO_ROOT_USER=${{ secrets.PRODUCTION_MINIO_ROOT_USER || 'minioadmin' }}
           MINIO_ROOT_PASSWORD=${{ secrets.PRODUCTION_MINIO_ROOT_PASSWORD }}
           MINIO_API_PORT=${{ secrets.PRODUCTION_MINIO_API_PORT || '9310' }}
@@ -468,134 +362,51 @@ jobs:
           REDIS_PORT=${{ secrets.PRODUCTION_REDIS_PORT || '6380' }}
           CACHE_TTL=300
           SECRET_KEY=${{ secrets.PRODUCTION_SECRET_KEY }}
-          JWT_ALGORITHM=RS256
-          JWT_EXPIRATION=3600
+          SERVICE_API_KEYS=${{ secrets.PRODUCTION_SERVICE_API_KEYS }}
           OIDC_PROVIDER_URL=${{ secrets.PRODUCTION_OIDC_PROVIDER_URL }}
           OIDC_CLIENT_ID=${{ secrets.PRODUCTION_OIDC_CLIENT_ID }}
           OIDC_CLIENT_SECRET=${{ secrets.PRODUCTION_OIDC_CLIENT_SECRET }}
-          OIDC_SCOPES=openid profile email
+          OIDC_AUDIENCES=${{ secrets.PRODUCTION_OIDC_AUDIENCES }}
           ALLOWED_ORIGINS=${{ secrets.PRODUCTION_ALLOWED_ORIGINS }}
           LOG_LEVEL=INFO
-          LOG_FORMAT=json
-          METRICS_ENABLED=true
-          METRICS_PORT=9090
-          TRACING_ENABLED=false
           CANONICAL_DB_API_PORT=${{ secrets.PRODUCTION_CANONICAL_DB_API_PORT || '9401' }}
           AUTH_ACL_API_PORT=${{ secrets.PRODUCTION_AUTH_ACL_API_PORT || '9402' }}
           API_WORKERS=4
-          API_RELOAD=false
-          DOMAIN=${{ secrets.PRODUCTION_DOMAIN }}
-          SSL_ENABLED=true
-          LETSENCRYPT_EMAIL=${{ secrets.LETSENCRYPT_EMAIL }}
-          NGINX_CLIENT_MAX_BODY_SIZE=100M
-          BACKUP_ENABLED=true
-          BACKUP_SCHEDULE=0 2 * * *
-          BACKUP_RETENTION_DAYS=30
-          MINIO_BACKUP_ENABLED=true
-          MINIO_BACKUP_BUCKET=enterprise-rag-backups
-          POSTGRES_MEMORY_LIMIT=4g
-          POSTGRES_CPU_LIMIT=2
-          MINIO_MEMORY_LIMIT=2g
-          MINIO_CPU_LIMIT=1
-          REDIS_MEMORY_LIMIT=1g
-          REDIS_CPU_LIMIT=0.5
-          API_MEMORY_LIMIT=1g
-          API_CPU_LIMIT=1
-          DEBUG=false
-          SQL_ECHO=false
-          FEATURE_DOCUMENT_INGESTION=true
-          FEATURE_VECTOR_SEARCH=false
-          FEATURE_BM25_SEARCH=false
-          FEATURE_KNOWLEDGE_GRAPH=false
-          FEATURE_ANSWER_GENERATION=false
-          RATE_LIMIT_ENABLED=true
-          RATE_LIMIT_PER_MINUTE=60
-          RATE_LIMIT_BURST=10
-          DEFAULT_TENANT_MAX_DOCUMENTS=10000
-          DEFAULT_TENANT_MAX_USERS=1000
-          DEFAULT_TENANT_MAX_STORAGE_GB=100
           EOF"
 
-      - name: Deploy with docker-compose (Blue-Green)
+      - name: Migrate and deploy
         env:
           SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
           SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
         run: |
           ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
-            docker compose pull && \
+            docker compose pull postgres redis && \
+            docker compose up -d postgres redis minio && \
+            timeout 120 bash -c 'until docker compose exec -T postgres pg_isready -U rag_admin; do sleep 3; done' && \
+            docker compose exec -T postgres bash /migrations/migrate.sh && \
             docker compose build --no-cache canonical-db-api auth-acl-api && \
             docker compose up -d --remove-orphans && \
-            echo '=== Container Status ===' && \
             docker compose ps"
-
-      - name: Check container logs on failure
-        if: failure()
-        env:
-          SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
-          SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
-          DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
-        run: |
-          echo "=== Canonical DB API Logs ==="
-          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose logs --tail=100 canonical-db-api" || true
-
-          echo ""
-          echo "=== Auth ACL API Logs ==="
-          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose logs --tail=100 auth-acl-api" || true
-
-          echo ""
-          echo "=== PostgreSQL Logs ==="
-          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose logs --tail=50 postgres" || true
-
-          echo ""
-          echo "=== Redis Logs ==="
-          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose logs --tail=50 redis" || true
-
-          echo ""
-          echo "=== Container Status ==="
-          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose ps -a" || true
-
-      - name: Wait for services to be healthy
-        env:
-          SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
-          SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
-          DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
-        run: |
-          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
-            timeout 120 bash -c 'until docker compose exec -T postgres pg_isready -U rag_admin; do sleep 5; done' && \
-            timeout 60 bash -c 'until docker compose exec -T redis redis-cli ping; do sleep 5; done' && \
-            timeout 60 bash -c 'until curl -f http://localhost:9000/minio/health/live; do sleep 5; done'"
 
       - name: Run health checks
         env:
           PRODUCTION_URL: ${{ secrets.PRODUCTION_URL }}
         run: |
-          # Wait for services to fully start
           sleep 15
-
-          # Check canonical-db-api health
           curl -f ${PRODUCTION_URL}/api/canonical-db/health
-
-          # Check auth-acl-api health
           curl -f ${PRODUCTION_URL}/api/auth-acl/health
 
-      - name: Notify deployment success
-        if: success()
-        run: |
-          echo "✅ Production deployment successful"
-          echo "🔗 Production URL: ${{ secrets.PRODUCTION_URL }}"
-
-      - name: Rollback on failure
+      - name: Diagnostics on failure
         if: failure()
         env:
           SERVER_HOST: ${{ secrets.PRODUCTION_SERVER_HOST }}
           SERVER_USER: ${{ secrets.PRODUCTION_SERVER_USER }}
           DEPLOY_PATH: ${{ secrets.PRODUCTION_DEPLOY_PATH }}
         run: |
-          echo "❌ Deployment failed, initiating rollback..."
-          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && \
-            docker compose down && \
-            # Restore from latest backup if needed
-            echo '⚠️ Manual intervention may be required'"
-
-# Made with Bob
+          # Deliberately does NOT take the stack down: a failed health check
+          # should not turn into a full outage. Restore manually if needed:
+          #   docker compose exec -T postgres pg_restore -U rag_admin -d enterprise_rag --clean < backups/<ts>/database.dump
+          ssh ${SERVER_USER}@${SERVER_HOST} "cd ${DEPLOY_PATH} && docker compose ps -a && \
+            docker compose logs --tail=100 canonical-db-api auth-acl-api postgres" || true
+          echo "❌ Deployment failed. Services were left running; see logs above and backups/ for restore."

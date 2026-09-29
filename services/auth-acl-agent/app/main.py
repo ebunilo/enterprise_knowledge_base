@@ -1,8 +1,8 @@
 """
 Auth ACL Agent - FastAPI Application
 
-Main application module for the Auth ACL Agent API.
-Provides authentication and access control for the Enterprise RAG System.
+Validates Keycloak access tokens and evaluates access to documents and chunks
+against PostgreSQL (AGENTS.md 5.2 and 5.11).
 """
 
 import logging
@@ -10,297 +10,103 @@ import time
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import JSONResponse
-# Prometheus disabled for Phase 1 MVP
-# from prometheus_client import Counter, Histogram
 
+from app import __version__
 from app.config import settings
 from app.database import check_database_connection, check_redis_connection
 from app.oidc import oidc_config
 from app.routers import acl, auth, health
 
-# Configure logging
-if settings.log_format.lower() == "json":
-    # For JSON logging, use a standard format and let structured logging handle it
-    # In production, you'd use python-json-logger or similar
-    logging.basicConfig(
-        level=settings.log_level,
-        format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-    )
-else:
-    # Use the provided format string
-    logging.basicConfig(
-        level=settings.log_level,
-        format=settings.log_format
-    )
+logging.basicConfig(
+    level=settings.log_level,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-# ============================================================================
-# Prometheus Metrics (Disabled for Phase 1 MVP)
-# ============================================================================
-# Metrics will be enabled in later phases when observability is implemented
-
-http_requests_total = None
-http_request_duration_seconds = None
-http_request_size_bytes = None
-http_response_size_bytes = None
-# Disabled for Phase 1 MVP
-# http_response_size_bytes = Histogram(
-#     'http_response_size_bytes',
-#     'HTTP response size in bytes',
-#     ['method', 'endpoint']
-# )
-
-
-# ============================================================================
-# Lifespan Events
-# ============================================================================
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """
-    Application lifespan manager.
-    
-    Handles startup and shutdown events.
-    """
-    # Startup
-    logger.info("=" * 80)
-    logger.info("Starting Auth ACL Agent API")
-    logger.info(f"Version: 0.1.0")
-    logger.info(f"Environment: {settings.environment}")
-    logger.info(f"Database: {settings.database_url.split('@')[-1]}")  # Hide credentials
-    logger.info(f"Redis: {settings.redis_host}:{settings.redis_port}")
-    logger.info(f"OIDC Provider: {settings.oidc_provider_url}")
-    logger.info(f"CORS Origins: {settings.cors_origins}")
-    logger.info("=" * 80)
-    
-    # Check database connection
-    if check_database_connection():
-        logger.info("✓ Database connection successful")
-    else:
-        logger.error("✗ Database connection failed")
-    
-    # Check Redis connection
-    if check_redis_connection():
-        logger.info("✓ Redis connection successful")
-    else:
-        logger.warning("✗ Redis connection failed (non-critical)")
-    
-    # Load OIDC configuration
+    logger.info("Starting Auth ACL Agent API %s (%s)", __version__, settings.environment)
+    logger.info("Database: %s", settings.database_url.split("@")[-1])
+    logger.info("OIDC provider: %s, accepted audiences: %s",
+                settings.oidc_provider_url, settings.accepted_audiences)
+
+    if not check_database_connection():
+        logger.error("Database connection failed")
+    if not check_redis_connection():
+        logger.warning("Redis connection failed (non-critical)")
     if await oidc_config.load_configuration():
-        logger.info("✓ OIDC configuration loaded successfully")
-        logger.info(f"  Issuer: {oidc_config.issuer}")
-        logger.info(f"  JWKS URI: {oidc_config.jwks_uri}")
+        logger.info("OIDC issuer: %s", oidc_config.issuer)
     else:
-        logger.error("✗ OIDC configuration failed to load")
-    
-    logger.info("Auth ACL Agent API started successfully")
-    
+        logger.error("OIDC configuration failed to load; all tokens will be rejected until it does")
+
     yield
-    
-    # Shutdown
     logger.info("Shutting down Auth ACL Agent API")
-    logger.info("Cleanup complete")
 
-
-# ============================================================================
-# FastAPI Application
-# ============================================================================
 
 app = FastAPI(
     title="Auth ACL Agent API",
-    description=(
-        "Authentication and access control for Enterprise RAG System. "
-        "Provides JWT token validation, user claims extraction, and "
-        "access control logic with multi-tenant support."
-    ),
-    version="0.1.0",
-    docs_url="/docs",
-    redoc_url="/redoc",
-    openapi_url="/openapi.json",
-    lifespan=lifespan
+    description="Keycloak token validation and PostgreSQL-backed access control for the Enterprise RAG System.",
+    version=__version__,
+    lifespan=lifespan,
 )
 
-
-# ============================================================================
-# Middleware
-# ============================================================================
-
-# CORS Middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-    expose_headers=["X-Total-Count", "X-Request-ID"]
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
+    expose_headers=["X-Request-ID"],
 )
-
-# GZip Compression
-app.add_middleware(
-    GZipMiddleware,
-    minimum_size=1000
-)
+app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
-# Request timing and metrics middleware
 @app.middleware("http")
 async def add_process_time_header(request: Request, call_next):
-    """
-    Add request processing time header and collect metrics.
-    """
-    start_time = time.time()
-    
-    # Get request size
-    request_size = int(request.headers.get("content-length", 0))
-    
-    # Process request
+    start_time = time.perf_counter()
     response = await call_next(request)
-    
-    # Calculate duration
-    process_time = time.time() - start_time
-    
-    # Add headers
-    response.headers["X-Process-Time"] = str(process_time)
-    
-    # Get response size
-    response_size = int(response.headers.get("content-length", 0))
-    
-    # Record metrics (disabled for Phase 1 MVP)
-    if http_requests_total is not None:
-        endpoint = request.url.path
-        method = request.method
-        status_code = response.status_code
-        
-        http_requests_total.labels(
-            method=method,
-            endpoint=endpoint,
-            status=status_code
-        ).inc()
-        
-        http_request_duration_seconds.labels(
-            method=method,
-            endpoint=endpoint
-        ).observe(process_time)
-        
-        if request_size > 0:
-            http_request_size_bytes.labels(
-                method=method,
-                endpoint=endpoint
-            ).observe(request_size)
-        
-        if response_size > 0:
-            http_response_size_bytes.labels(
-                method=method,
-                endpoint=endpoint
-            ).observe(response_size)
-    
+    response.headers["X-Process-Time"] = f"{time.perf_counter() - start_time:.4f}"
     return response
 
 
-# ============================================================================
-# Exception Handlers
-# ============================================================================
-
 @app.exception_handler(RequestValidationError)
 async def validation_exception_handler(request: Request, exc: RequestValidationError):
-    """
-    Handle request validation errors.
-    """
-    logger.warning(f"Validation error: {exc.errors()}")
-    
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "error": "Validation Error",
             "detail": "Request validation failed",
-            "errors": exc.errors()
-        }
+            "errors": jsonable_encoder(exc.errors()),
+        },
     )
 
 
 @app.exception_handler(Exception)
 async def general_exception_handler(request: Request, exc: Exception):
-    """
-    Handle unexpected exceptions.
-    """
-    logger.error(f"Unexpected error: {exc}", exc_info=True)
-    
+    logger.error("Unexpected error on %s %s: %s", request.method, request.url.path, exc, exc_info=True)
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-        content={
-            "error": "Internal Server Error",
-            "detail": "An unexpected error occurred"
-        }
+        content={"error": "Internal Server Error", "detail": "An unexpected error occurred"},
     )
 
 
-# ============================================================================
-# Routers
-# ============================================================================
-
-# Health check router (no prefix)
-app.include_router(
-    health.router,
-    tags=["Health"]
-)
-
-# API v1 routers
-app.include_router(
-    auth.router,
-    prefix="/api/v1/auth",
-    tags=["Authentication"]
-)
-
-app.include_router(
-    acl.router,
-    prefix="/api/v1/acl",
-    tags=["Access Control"]
-)
+app.include_router(health.router, tags=["Health"])
+app.include_router(auth.router, prefix="/api/v1/auth")
+app.include_router(acl.router, prefix="/api/v1/acl")
 
 
-# ============================================================================
-# Root Endpoint
-# ============================================================================
-
-@app.get(
-    "/",
-    summary="Root endpoint",
-    description="Get API information",
-    tags=["Root"]
-)
+@app.get("/", tags=["Root"])
 async def root():
-    """
-    Root endpoint - returns API information.
-    """
     return {
         "service": "auth-acl-agent",
-        "version": "0.1.0",
-        "description": "Authentication and access control for Enterprise RAG System",
+        "version": __version__,
         "status": "running",
         "docs": "/docs",
         "health": "/health",
-        "metrics": "/metrics",
-        "oidc_provider": settings.oidc_provider_url
     }
-
-
-# ============================================================================
-# Application Entry Point
-# ============================================================================
-
-if __name__ == "__main__":
-    import uvicorn
-    
-    uvicorn.run(
-        "app.main:app",
-        host="0.0.0.0",
-        port=8000,
-        reload=True,
-        log_level=settings.log_level.lower()
-    )
-
-# Made with Bob

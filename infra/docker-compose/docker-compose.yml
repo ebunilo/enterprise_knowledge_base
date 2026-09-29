@@ -1,3 +1,17 @@
+x-logging: &default-logging
+  driver: "json-file"
+  options:
+    max-size: "10m"
+    max-file: "3"
+
+# Published ports bind to BIND_ADDRESS (default 127.0.0.1). nginx on the host
+# proxies to them; Docker-published ports bypass host firewalls such as ufw,
+# so binding to 0.0.0.0 would expose PostgreSQL and Redis to the internet.
+#
+# Services connect to PostgreSQL as the non-superuser role `rag_app` when
+# APP_DB_PASSWORD is set, which is what makes Row-Level Security apply
+# (superusers bypass RLS). Without it they fall back to the admin role.
+
 services:
   # PostgreSQL 15+ - Canonical Database
   postgres:
@@ -10,34 +24,38 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
       POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=en_US.UTF-8"
       PGDATA: /var/lib/postgresql/data/pgdata
+      # Consumed by /migrations/migrate.sh to enable the rag_app login.
+      APP_DB_PASSWORD: ${APP_DB_PASSWORD:-}
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./postgres/init:/docker-entrypoint-initdb.d:ro
+      - ./postgres/migrations:/migrations:ro
       - ./postgres/conf/postgresql.conf:/etc/postgresql/postgresql.conf:ro
     ports:
-      - "${POSTGRES_PORT:-5433}:5432"
+      - "${BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-5433}:5432"
     command: postgres -c config_file=/etc/postgresql/postgresql.conf
     healthcheck:
-      test:
-        [
-          "CMD-SHELL",
-          "pg_isready -U ${POSTGRES_USER:-rag_admin} -d ${POSTGRES_DB:-enterprise_rag}",
-        ]
+      # TCP, not the socket: during first-boot init the temporary server only
+      # listens on the socket, so this stays unhealthy until init + migrations
+      # have finished and dependants do not start early.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U ${POSTGRES_USER:-rag_admin} -d ${POSTGRES_DB:-enterprise_rag}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
     networks:
       - rag_network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   # MinIO - S3-Compatible Object Storage
+  # minio/minio was removed from Docker Hub. Default to Chainguard's maintained
+  # build; existing servers keep their locally cached image by setting
+  # MINIO_IMAGE=minio/minio:latest (pull_policy: missing never re-pulls it).
   minio:
-    image: minio/minio:latest
+    image: ${MINIO_IMAGE:-cgr.dev/chainguard/minio:latest}
+    pull_policy: missing
+    # Upstream MinIO ran as root; keeps existing root-owned volumes writable.
+    user: "0:0"
     container_name: enterprise-rag-minio
     restart: unless-stopped
     environment:
@@ -47,22 +65,14 @@ services:
     volumes:
       - minio_data:/data
     ports:
-      - "${MINIO_API_PORT:-9000}:9000"
-      - "${MINIO_CONSOLE_PORT:-9001}:9001"
+      - "${BIND_ADDRESS:-127.0.0.1}:${MINIO_API_PORT:-9000}:9000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${MINIO_CONSOLE_PORT:-9001}:9001"
     command: server /data --console-address ":9001"
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9000/minio/health/live"]
-      interval: 10s
-      timeout: 5s
-      retries: 5
-      start_period: 30s
+    # No healthcheck: minimal images ship neither curl nor mc, and no service
+    # depends on MinIO yet.
     networks:
       - rag_network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
   # Redis - Caching and Session Management
   redis:
@@ -79,64 +89,41 @@ services:
     volumes:
       - redis_data:/data
     ports:
-      - "${REDIS_PORT:-6380}:6379"
+      - "${BIND_ADDRESS:-127.0.0.1}:${REDIS_PORT:-6380}:6379"
     healthcheck:
-      test:
-        [
-          "CMD",
-          "redis-cli",
-          "--no-auth-warning",
-          "-a",
-          "${REDIS_PASSWORD}",
-          "ping",
-        ]
+      test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD}", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 10s
     networks:
       - rag_network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
-  # Canonical DB Agent API (Phase 1)
+  # Canonical DB Agent API
   canonical-db-api:
     build:
-      context: ./services/canonical-db-agent
+      # ../../services when run from the repo; the deploy workflow sets
+      # SERVICES_DIR=./services because it copies services/ next to this file.
+      context: ${SERVICES_DIR:-../../services}/canonical-db-agent
       dockerfile: Dockerfile
     container_name: enterprise-rag-canonical-db-api
     restart: unless-stopped
     environment:
-      # Database
-      DATABASE_URL: postgresql://${POSTGRES_USER:-rag_admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-enterprise_rag}
+      DATABASE_URL: postgresql://${APP_DB_USER:-rag_admin}:${APP_DB_PASSWORD:-${POSTGRES_PASSWORD}}@postgres:5432/${POSTGRES_DB:-enterprise_rag}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
-
-      # Redis
       REDIS_URL: redis://:${REDIS_PASSWORD}@redis:6379/0
-
-      # API
-      API_HOST: 0.0.0.0
-      API_PORT: 8000
       API_WORKERS: ${API_WORKERS:-4}
-      API_RELOAD: ${API_RELOAD:-false}
-
-      # Security
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
+      SERVICE_API_KEYS: ${SERVICE_API_KEYS:-}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
-
-      # Logging
+      AUDIT_STORE_QUERY_TEXT: ${AUDIT_STORE_QUERY_TEXT:-false}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LOG_FORMAT: json
-
-      # Environment
       ENVIRONMENT: ${ENVIRONMENT:-production}
     ports:
-      - "${CANONICAL_DB_API_PORT:-8001}:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${CANONICAL_DB_API_PORT:-8001}:8000"
     depends_on:
       postgres:
         condition: service_healthy
@@ -150,62 +137,42 @@ services:
       start_period: 30s
     networks:
       - rag_network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
-  # Auth ACL Agent API (Phase 1)
+  # Auth ACL Agent API
   auth-acl-api:
     build:
-      context: ./services/auth-acl-agent
+      context: ${SERVICES_DIR:-../../services}/auth-acl-agent
       dockerfile: Dockerfile
     container_name: enterprise-rag-auth-acl-api
     restart: unless-stopped
     environment:
-      # Database
-      DATABASE_URL: postgresql://${POSTGRES_USER:-rag_admin}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-enterprise_rag}
+      DATABASE_URL: postgresql://${APP_DB_USER:-rag_admin}:${APP_DB_PASSWORD:-${POSTGRES_PASSWORD}}@postgres:5432/${POSTGRES_DB:-enterprise_rag}
       DB_POOL_SIZE: ${DB_POOL_SIZE:-20}
       DB_MAX_OVERFLOW: ${DB_MAX_OVERFLOW:-10}
       DB_POOL_TIMEOUT: ${DB_POOL_TIMEOUT:-30}
-
-      # Redis
       REDIS_HOST: redis
       REDIS_PORT: 6379
       REDIS_PASSWORD: ${REDIS_PASSWORD:?REDIS_PASSWORD is required}
       REDIS_DB: 1
       CACHE_TTL: ${CACHE_TTL:-300}
-
-      # API
-      API_HOST: 0.0.0.0
-      API_PORT: 8000
-      API_WORKERS: ${API_WORKERS:-4}
-
-      # OAuth/OIDC
+      # Keycloak realm URL, e.g. https://auth.igwilo.com/realms/<realm>
       OIDC_PROVIDER_URL: ${OIDC_PROVIDER_URL:?OIDC_PROVIDER_URL is required}
       OIDC_CLIENT_ID: ${OIDC_CLIENT_ID:?OIDC_CLIENT_ID is required}
       OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?OIDC_CLIENT_SECRET is required}
-
-      # Security
+      OIDC_AUDIENCES: ${OIDC_AUDIENCES:-}
+      EXTERNAL_GROUPS: ${EXTERNAL_GROUPS:-external-users}
+      ENFORCE_CLEARANCE: ${ENFORCE_CLEARANCE:-true}
       SECRET_KEY: ${SECRET_KEY:?SECRET_KEY is required}
-      JWT_ALGORITHM: ${JWT_ALGORITHM:-RS256}
-      JWT_EXPIRATION: ${JWT_EXPIRATION:-3600}
-
-      # Logging
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
       LOG_LEVEL: ${LOG_LEVEL:-INFO}
-      LOG_FORMAT: json
-
-      # Environment
       ENVIRONMENT: ${ENVIRONMENT:-production}
     ports:
-      - "${AUTH_ACL_API_PORT:-8002}:8000"
+      - "${BIND_ADDRESS:-127.0.0.1}:${AUTH_ACL_API_PORT:-8002}:8000"
     depends_on:
       postgres:
         condition: service_healthy
       redis:
-        condition: service_healthy
-      canonical-db-api:
         condition: service_healthy
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -215,11 +182,7 @@ services:
       start_period: 30s
     networks:
       - rag_network
-    logging:
-      driver: "json-file"
-      options:
-        max-size: "10m"
-        max-file: "3"
+    logging: *default-logging
 
 networks:
   rag_network:
@@ -235,5 +198,3 @@ volumes:
     driver: local
   redis_data:
     driver: local
-
-# Made with Bob

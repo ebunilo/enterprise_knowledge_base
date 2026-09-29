@@ -1,11 +1,5 @@
-"""
-API routers package.
+"""API routers for the Canonical DB Agent API."""
 
-This package contains all FastAPI routers for the Canonical DB Agent API.
-"""
+from app.routers import chunks, documents, feedback, health
 
-from app.routers import chunks, documents, health
-
-__all__ = ["health", "documents", "chunks"]
-
-# Made with Bob
+__all__ = ["health", "documents", "chunks", "feedback"]

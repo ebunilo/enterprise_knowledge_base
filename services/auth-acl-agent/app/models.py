@@ -1,141 +1,98 @@
 """
-SQLAlchemy ORM models for Auth ACL Agent.
-
-This module defines database models for access policies and related entities.
+Read models for the ACL engine. The tables are owned by the canonical schema
+(infra/docker-compose/postgres); this service only reads them, apart from
+appending ACL decision events to audit_logs.
 """
 
-from datetime import datetime
-from uuid import UUID, uuid4
+from uuid import uuid4
 
-from sqlalchemy import ARRAY, Boolean, Column, DateTime, ForeignKey, String, Text
-from sqlalchemy.dialects.postgresql import UUID as PGUUID
-from sqlalchemy.ext.declarative import declarative_base
-from sqlalchemy.orm import relationship
+from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Text, TIMESTAMP
+from sqlalchemy.dialects.postgresql import ARRAY, INET, JSONB, UUID
+from sqlalchemy.orm import declarative_base
+from sqlalchemy.sql import func
 
 Base = declarative_base()
 
 
-# ============================================================================
-# Access Policy Model
-# ============================================================================
+class Tenant(Base):
+    __tablename__ = "tenants"
+
+    tenant_id = Column(UUID(as_uuid=True), primary_key=True)
+    tenant_slug = Column(String(100), nullable=False)
+    is_active = Column(Boolean)
+
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    document_id = Column(UUID(as_uuid=True), primary_key=True)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    classification = Column(String(50), nullable=False)
+    department = Column(String(100))
+    region = Column(String(100))
+    tags = Column(ARRAY(Text))
+    status = Column(String(20), nullable=False)
+    is_current_version = Column(Boolean, nullable=False)
+
+
+class DocumentChunk(Base):
+    __tablename__ = "document_chunks"
+
+    chunk_id = Column(UUID(as_uuid=True), primary_key=True)
+    document_id = Column(UUID(as_uuid=True), ForeignKey("documents.document_id"), nullable=False)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+
 
 class AccessPolicy(Base):
     """
-    Access policy for documents and chunks.
-    
-    Defines who can access a document based on classification,
-    departments, groups, roles, users, and regions.
+    A policy applies to a document when every selector it sets matches
+    (document_id, classification, department, region, tags). Deny lists on
+    any applicable policy override every allow.
     """
-    
+
     __tablename__ = "access_policies"
-    
-    # Primary key
-    policy_id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
-    
-    # Tenant isolation
-    tenant_id = Column(String(100), nullable=False, index=True)
-    
-    # Document reference (nullable for default policies)
-    document_id = Column(PGUUID(as_uuid=True), nullable=True, index=True)
-    
-    # Classification level
-    classification = Column(String(50), nullable=False, index=True)
-    # Values: PUBLIC, INTERNAL_GENERAL, DEPARTMENT_RESTRICTED, CONFIDENTIAL, REGULATED, EXECUTIVE_ONLY
-    
-    # Allowed access
-    allowed_departments = Column(ARRAY(String), nullable=True)
-    allowed_groups = Column(ARRAY(String), nullable=True)
-    allowed_roles = Column(ARRAY(String), nullable=True)
-    allowed_users = Column(ARRAY(String), nullable=True)
-    allowed_regions = Column(ARRAY(String), nullable=True)
-    
-    # Denied access (overrides allowed)
-    denied_users = Column(ARRAY(String), nullable=True)
-    
-    # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-    
-    # Indexes
-    __table_args__ = (
-        {"schema": "public"}
-    )
-    
-    def __repr__(self):
-        return f"<AccessPolicy(policy_id={self.policy_id}, classification={self.classification})>"
+
+    policy_id = Column(UUID(as_uuid=True), primary_key=True)
+    tenant_id = Column(UUID(as_uuid=True), nullable=False)
+    policy_name = Column(String(255), nullable=False)
+    priority = Column(Integer, nullable=False)
+
+    # Selectors
+    document_id = Column(UUID(as_uuid=True))
+    classification = Column(String(50))
+    department = Column(String(100))
+    region = Column(String(100))
+    tags = Column(ARRAY(Text))
+
+    # Rules
+    allowed_users = Column(ARRAY(Text))
+    denied_users = Column(ARRAY(Text))
+    allowed_groups = Column(ARRAY(Text))
+    denied_groups = Column(ARRAY(Text))
+    allowed_departments = Column(ARRAY(Text))
+    denied_departments = Column(ARRAY(Text))
+    allowed_roles = Column(ARRAY(Text))
+    denied_roles = Column(ARRAY(Text))
+    allowed_regions = Column(ARRAY(Text))
+    denied_regions = Column(ARRAY(Text))
+
+    is_active = Column(Boolean, nullable=False)
+    effective_from = Column(TIMESTAMP(timezone=True))
+    effective_until = Column(TIMESTAMP(timezone=True))
 
 
-# ============================================================================
-# User Session Model (Optional - for session management)
-# ============================================================================
+class AuditLog(Base):
+    __tablename__ = "audit_logs"
 
-class UserSession(Base):
-    """
-    User session tracking for audit and security.
-    
-    Tracks active user sessions and token usage.
-    """
-    
-    __tablename__ = "user_sessions"
-    
-    # Primary key
-    session_id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
-    
-    # User identification
-    user_id = Column(String(255), nullable=False, index=True)
-    tenant_id = Column(String(100), nullable=False, index=True)
-    email = Column(String(255), nullable=True)
-    
-    # Session details
-    token_hash = Column(String(64), nullable=False, unique=True, index=True)
-    expires_at = Column(DateTime, nullable=False)
-    is_active = Column(Boolean, default=True, nullable=False)
-    
-    # Metadata
-    created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-    last_activity = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow, nullable=False)
-    
-    # User agent and IP (for security)
-    user_agent = Column(Text, nullable=True)
-    ip_address = Column(String(45), nullable=True)
-    
-    def __repr__(self):
-        return f"<UserSession(session_id={self.session_id}, user_id={self.user_id})>"
-
-
-# ============================================================================
-# Access Denial Log Model (Optional - for security monitoring)
-# ============================================================================
-
-class AccessDenialLog(Base):
-    """
-    Log of access denials for security monitoring.
-    
-    Tracks when users are denied access to documents/chunks.
-    """
-    
-    __tablename__ = "access_denial_logs"
-    
-    # Primary key
-    log_id = Column(PGUUID(as_uuid=True), primary_key=True, default=uuid4)
-    
-    # User identification
-    user_id = Column(String(255), nullable=False, index=True)
-    tenant_id = Column(String(100), nullable=False, index=True)
-    
-    # Resource identification
-    document_id = Column(PGUUID(as_uuid=True), nullable=True, index=True)
-    chunk_id = Column(PGUUID(as_uuid=True), nullable=True, index=True)
-    
-    # Denial reason
-    reason = Column(String(100), nullable=False)
-    # Values: tenant_mismatch, explicit_deny, classification_mismatch, 
-    #         department_mismatch, group_mismatch, role_mismatch, region_mismatch
-    
-    # Metadata
-    denied_at = Column(DateTime, default=datetime.utcnow, nullable=False, index=True)
-    
-    def __repr__(self):
-        return f"<AccessDenialLog(log_id={self.log_id}, user_id={self.user_id}, reason={self.reason})>"
-
-# Made with Bob
+    log_id = Column(UUID(as_uuid=True), primary_key=True, default=uuid4)
+    tenant_id = Column(UUID(as_uuid=True), primary_key=True)
+    created_at = Column(TIMESTAMP(timezone=True), primary_key=True, server_default=func.now())
+    event_type = Column(String(100), nullable=False)
+    event_category = Column(String(50), nullable=False)
+    user_email = Column(String(255))
+    resource_type = Column(String(100))
+    action = Column(String(100), nullable=False)
+    result = Column(String(50), nullable=False)
+    details = Column(JSONB, nullable=False, default=dict)
+    ip_address = Column(INET)
+    user_agent = Column(Text)

@@ -75,7 +75,7 @@ app_info.labels(version='0.1.0', service='canonical-db-agent').set(1)
     description="Check the health status of the service and its dependencies",
     tags=["Health"]
 )
-async def health_check():
+def health_check():
     """
     Comprehensive health check endpoint.
     
@@ -134,7 +134,7 @@ async def health_check():
     description="Kubernetes readiness probe - checks if service is ready to accept traffic",
     tags=["Health"]
 )
-async def readiness_check():
+def readiness_check():
     """
     Kubernetes readiness probe.
     
